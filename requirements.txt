@@ -3,5 +3,5 @@ pdfplumber
 pandas
 openpyxl
 requests
-anthropic
 python-dotenv
+Pillow
