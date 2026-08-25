@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENAI_MODEL = "gpt-4o-mini"
-MAX_CHARS = 15000  # contract text sent to the model per document
+MAX_CHARS = 80000  # contract text sent to the model per document (~20k tokens — comfortably covers most contracts)
 
 st.set_page_config(page_title="Contract Terms Extract", page_icon="📄", layout="wide")
 
@@ -426,22 +426,19 @@ def build_source_items(file_name: str, parsed: dict, active_fields: list) -> lis
     field_values = parsed.get("fields", {})
     for f in active_fields:
         entry = field_values.get(f["name"], {})
-        if not isinstance(entry, dict):
-            continue
-        value, quote = entry.get("value", "Not found"), entry.get("source", "")
-        if quote:
-            items.append({"label": f["name"], "value": value, "quote": quote})
+        if isinstance(entry, dict):
+            value, quote = entry.get("value", "Not found"), entry.get("source", "")
+        else:
+            value, quote = entry, ""
+        items.append({"label": f["name"], "value": value, "quote": quote})
 
     for i, ch in enumerate(parsed.get("channels") or [], start=1):
         name = ch.get("name", f"Channel {i}")
-        if ch.get("name_source"):
-            items.append({"label": f"{name} — Name", "value": name, "quote": ch["name_source"]})
-        if ch.get("rate_source"):
-            rate_display = f"{ch.get('rate_currency', '')} {ch.get('rate_value', '')} / {ch.get('rate_unit_label', '')}".strip()
-            items.append({"label": f"{name} — Rate", "value": rate_display, "quote": ch["rate_source"]})
-        if ch.get("volume_source"):
-            vol_display = f"{ch.get('volume_low', '')} – {ch.get('volume_high', '')}"
-            items.append({"label": f"{name} — Volume", "value": vol_display, "quote": ch["volume_source"]})
+        rate_display = f"{ch.get('rate_currency', '')} {ch.get('rate_value', '')} / {ch.get('rate_unit_label', '')}".strip()
+        vol_display = f"{ch.get('volume_low', '')} – {ch.get('volume_high', '')}"
+        items.append({"label": f"{name} — Name", "value": name, "quote": ch.get("name_source", "")})
+        items.append({"label": f"{name} — Rate", "value": rate_display, "quote": ch.get("rate_source", "")})
+        items.append({"label": f"{name} — Volume", "value": vol_display, "quote": ch.get("volume_source", "")})
 
     return items
 
@@ -468,6 +465,7 @@ if st.button(
     rows = []
     source_items = {}
     pdf_bytes_map = {}
+    truncation_warnings = []
     progress = st.progress(0.0, text="Starting...")
 
     for idx, file in enumerate(uploaded_files):
@@ -483,6 +481,8 @@ if st.button(
             rows.append({"File": file.name, "Error": "No extractable text (likely a scanned/image PDF — needs OCR)"})
             continue
 
+        if len(text) > MAX_CHARS:
+            truncation_warnings.append(f"{file.name} ({len(text):,} characters — only the first {MAX_CHARS:,} were analyzed)")
         truncated = text[:MAX_CHARS]
         prompt = build_prompt(truncated, active_fields)
 
@@ -502,8 +502,13 @@ if st.button(
     st.session_state.source_items = source_items
     st.session_state.pdf_bytes = pdf_bytes_map
     st.session_state.selected_source = None
+    st.session_state.truncation_warnings = truncation_warnings
 
 if st.session_state.results is not None:
+    if st.session_state.get("truncation_warnings"):
+        for w in st.session_state.truncation_warnings:
+            st.warning(f"⚠️ {w} — terms appearing later in the document may have been missed.")
+
     st.markdown('<div class="step-label">Results</div>', unsafe_allow_html=True)
     st.markdown(
         st.session_state.results.to_html(index=False, escape=False, na_rep=""),
@@ -534,12 +539,14 @@ if st.session_state.results is not None:
                 col_list, col_preview = st.columns([2, 3])
                 with col_list:
                     for i, item in enumerate(items):
-                        if st.button(
-                            f"{item['label']}: {item['value']}",
+                        has_quote = bool(item["quote"])
+                        st.button(
+                            f"{item['label']}: {item['value']}" + ("" if has_quote else "  (no source found)"),
                             key=f"src_{file_name}_{i}",
                             use_container_width=True,
-                        ):
-                            st.session_state.selected_source = (file_name, i)
+                            disabled=not has_quote,
+                            on_click=(lambda fn=file_name, idx=i: st.session_state.__setitem__("selected_source", (fn, idx))) if has_quote else None,
+                        )
 
                 with col_preview:
                     sel = st.session_state.selected_source
