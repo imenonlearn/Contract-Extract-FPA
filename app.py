@@ -193,35 +193,73 @@ def extract_pdf_text(file) -> str:
     return "\n".join(text_parts)
 
 
+def _boxes_from_chars(chars):
+    """Groups matched characters by visual line, returning one bbox per line
+    so a match spanning a line-wrap highlights correctly instead of one box
+    stretching across both lines."""
+    lines = {}
+    for c in chars:
+        key = round(c["top"], 1)
+        lines.setdefault(key, []).append(c)
+    boxes = []
+    for cs in lines.values():
+        boxes.append((
+            min(c["x0"] for c in cs),
+            min(c["top"] for c in cs),
+            max(c["x1"] for c in cs),
+            max(c["bottom"] for c in cs),
+        ))
+    return boxes
+
+
 def locate_quote(pdf_bytes: bytes, quote: str):
-    """Search every page for the quote. Returns (page_number, bbox) or None if not found."""
+    """Search every page for the quote. Returns (page_number, [bbox, ...]) or None if not found.
+    Multiple boxes are returned when the match spans a line wrap."""
     if not quote or not quote.strip():
         return None
     quote = quote.strip()
+    words = quote.split()
+
+    # Build a whitespace-tolerant regex so line wraps, extra spaces, or
+    # non-breaking spaces in the PDF's text don't break an otherwise-correct match.
+    def flexible_pattern(word_list):
+        return r"\s+".join(re.escape(w) for w in word_list)
+
+    # Try the full quote first, then progressively shorter windows (in case the
+    # model's quote includes a word or two not present verbatim in the source).
+    attempts = [words]
+    if len(words) > 4:
+        attempts.append(words[: len(words) - 2])
+        attempts.append(words[2:])
+    if len(words) > 6:
+        attempts.append(words[2:-2])
+
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page_num, page in enumerate(pdf.pages):
-                # Try exact match first, then progressively shorter prefixes as a fallback
-                # in case the model's quote drifts slightly from the source text.
-                for attempt in (quote, quote[: max(len(quote) // 2, 8)]):
+                for word_set in attempts:
+                    if not word_set:
+                        continue
+                    pattern = flexible_pattern(word_set)
                     try:
-                        matches = page.search(attempt, regex=False, case=False)
+                        matches = page.search(pattern, regex=True, case=False)
                     except Exception:
                         matches = []
                     if matches:
-                        m = matches[0]
-                        return page_num, (m["x0"], m["top"], m["x1"], m["bottom"])
+                        boxes = _boxes_from_chars(matches[0]["chars"])
+                        if boxes:
+                            return page_num, boxes
     except Exception:
         return None
     return None
 
 
-def render_highlighted_page(pdf_bytes: bytes, page_number: int, bbox) -> bytes:
-    """Renders the given page as a PNG with the bbox highlighted. Returns PNG bytes."""
+def render_highlighted_page(pdf_bytes: bytes, page_number: int, boxes) -> bytes:
+    """Renders the given page as a PNG with each bbox in `boxes` highlighted."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         page = pdf.pages[page_number]
         im = page.to_image(resolution=150)
-        if bbox:
+        for bbox in boxes or []:
             im.draw_rect(bbox, fill=(255, 224, 102, 90), stroke=(230, 126, 14), stroke_width=2)
         buf = io.BytesIO()
         im.save(buf, format="PNG")
@@ -510,8 +548,8 @@ if st.session_state.results is not None:
                         pdf_bytes = st.session_state.pdf_bytes.get(file_name)
                         located = locate_quote(pdf_bytes, item["quote"]) if pdf_bytes else None
                         if located:
-                            page_num, bbox = located
-                            png = render_highlighted_page(pdf_bytes, page_num, bbox)
+                            page_num, boxes = located
+                            png = render_highlighted_page(pdf_bytes, page_num, boxes)
                             st.image(png, caption=f"Page {page_num + 1}", use_container_width=True)
                         else:
                             st.info(f"Couldn't pinpoint this on the page. Quoted text: \u201c{item['quote']}\u201d")
