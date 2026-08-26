@@ -159,6 +159,44 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Step 1: define fields
 # ---------------------------------------------------------------------------
+def extract_pdf_text(file) -> str:
+    text_parts = []
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+    return "\n".join(text_parts)
+
+
+def call_openai(prompt: str, api_key: str, model: str) -> str:
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+def parse_json_response(raw: str) -> dict:
+    cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+        return {"error": "Could not parse model response", "raw_response": raw[:500]}
+
+
 def render_audit_mode():
     st.markdown('<div class="step-label">1 · Define the fields to extract</div>', unsafe_allow_html=True)
 
@@ -566,6 +604,157 @@ def render_audit_mode():
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
+CLASSIFICATION_CATEGORIES = {
+    "HC": "Human Capital",
+    "CO": "Incentives for Entrepreneurship",
+    "CS": "Corporate Services",
+    "GS": "Growth Strategy",
+    "MM": "Marketing and Communication",
+}
+
+
+def build_classification_prompt(contract_text: str) -> str:
+    category_lines = "\n".join(f'  - "{abbr}" = {full}' for abbr, full in CLASSIFICATION_CATEGORIES.items())
+    return f"""You are classifying a contract along two dimensions. Read the contract text below and
+return ONLY a JSON object with exactly this shape:
+
+{{
+  "pricing_classification": "Fixed" | "Variable" | "Mixed" | "Not found",
+  "category": "HC" | "CO" | "CS" | "GS" | "MM",
+  "category_reasoning": "<one short phrase, under 12 words, on why this category fits>"
+}}
+
+Rules:
+- Classify "pricing_classification" as "Variable" if fees depend on usage/volume (e.g. per-click, per-impression, per-lead, commission-based), "Fixed" if it's a flat recurring or one-time fee, "Mixed" if both appear, "Not found" if unclear.
+- Classify "category" as exactly one of the following abbreviations, based on the contract's subject matter and the nature of the services/goods being provided:
+{category_lines}
+- Pick the single best-fitting category even if the contract could plausibly touch more than one — choose based on the PRIMARY subject matter of the agreement.
+- Return ONLY the JSON object, no other text, no markdown fences.
+
+CONTRACT TEXT:
+\"\"\"
+{contract_text}
+\"\"\"
+"""
+
+
+def render_classification_mode():
+    st.markdown('<div class="step-label">1 · Upload contracts</div>', unsafe_allow_html=True)
+    uploaded_files = st.file_uploader(
+        "PDF files", type=["pdf"], accept_multiple_files=True,
+        label_visibility="collapsed", key="classification_uploader",
+    )
+
+    if "classification_results" not in st.session_state:
+        st.session_state.classification_results = None
+
+    st.markdown('<div class="step-label">2 · Classify</div>', unsafe_allow_html=True)
+    if st.button(
+        "Classify contracts",
+        type="primary",
+        disabled=not (uploaded_files and OPENAI_API_KEY),
+    ):
+        results = []
+        progress = st.progress(0.0, text="Starting...")
+
+        for idx, file in enumerate(uploaded_files):
+            progress.progress(idx / len(uploaded_files), text=f"Reading {file.name}...")
+            try:
+                text = extract_pdf_text(file)
+            except Exception as e:
+                results.append({"file": file.name, "error": f"Failed to read PDF: {e}"})
+                continue
+
+            if not text.strip():
+                results.append({"file": file.name, "error": "No extractable text (likely a scanned/image PDF)"})
+                continue
+
+            prompt = build_classification_prompt(text[:MAX_CHARS])
+            progress.progress((idx + 0.5) / len(uploaded_files), text=f"Classifying {file.name}...")
+            try:
+                raw = call_openai(prompt, OPENAI_API_KEY, OPENAI_MODEL)
+            except Exception as e:
+                results.append({"file": file.name, "error": f"Classification failed: {e}"})
+                continue
+
+            parsed = parse_json_response(raw)
+            if "error" in parsed:
+                results.append({"file": file.name, "error": parsed["error"]})
+                continue
+
+            results.append({
+                "file": file.name,
+                "pricing_classification": parsed.get("pricing_classification", "Not found"),
+                "category": parsed.get("category", "") if parsed.get("category") in CLASSIFICATION_CATEGORIES else "",
+                "category_reasoning": parsed.get("category_reasoning", ""),
+            })
+
+        progress.progress(1.0, text="Done")
+        st.session_state.classification_results = results
+
+    results = st.session_state.classification_results
+    if not results:
+        return
+
+    st.markdown('<div class="step-label">Results</div>', unsafe_allow_html=True)
+
+    header = st.columns([2.2, 1.5, 1.8, 1.8])
+    header[0].markdown("**File**")
+    header[1].markdown("**Pricing Classification**")
+    header[2].markdown("**Suggested Category**")
+    header[3].markdown("**Reviewer Classification**")
+
+    category_options = list(CLASSIFICATION_CATEGORIES.keys())
+    export_rows = []
+
+    for r in results:
+        row = st.columns([2.2, 1.5, 1.8, 1.8])
+        row[0].write(r["file"])
+
+        if "error" in r:
+            row[1].write("—")
+            row[2].write("—")
+            row[3].write(r["error"])
+            export_rows.append({
+                "File": r["file"], "Pricing Classification": "Error",
+                "Suggested Category": "", "Reviewer Classification": "", "Notes": r["error"],
+            })
+            continue
+
+        row[1].write(r["pricing_classification"])
+        suggested = r["category"]
+        suggested_label = f"{suggested} — {CLASSIFICATION_CATEGORIES[suggested]}" if suggested else "Not classified"
+        row[2].write(suggested_label)
+
+        default_index = category_options.index(suggested) if suggested in category_options else 0
+        reviewer_choice = row[3].selectbox(
+            "Reviewer override",
+            category_options,
+            index=default_index,
+            key=f"reviewer_class_{r['file']}",
+            label_visibility="collapsed",
+            format_func=lambda abbr: f"{abbr} — {CLASSIFICATION_CATEGORIES[abbr]}",
+        )
+
+        export_rows.append({
+            "File": r["file"],
+            "Pricing Classification": r["pricing_classification"],
+            "Suggested Category": suggested,
+            "Reviewer Classification": reviewer_choice,
+            "Notes": r.get("category_reasoning", ""),
+        })
+
+    st.caption("Reviewer Classification defaults to the suggested category — change it if the model got it wrong.")
+
+    export_df = pd.DataFrame(export_rows)
+    buffer = io.BytesIO()
+    export_df.to_excel(buffer, index=False, engine="openpyxl")
+    st.download_button(
+        "Download as Excel",
+        data=buffer.getvalue(),
+        file_name="contract_classification.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 def guess_column(columns, keywords):
     for col in columns:
         norm = str(col).strip().lower()
@@ -767,7 +956,7 @@ def render_forecast_mode():
 # ---------------------------------------------------------------------------
 mode = st.radio(
     "Mode",
-    ["Contract Audit", "Forecasting"],
+    ["Contract Audit", "Contract Classification", "Forecasting"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -775,5 +964,7 @@ st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
 
 if mode == "Contract Audit":
     render_audit_mode()
+elif mode == "Contract Classification":
+    render_classification_mode()
 else:
     render_forecast_mode()
