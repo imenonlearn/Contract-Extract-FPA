@@ -639,51 +639,58 @@ CONTRACT TEXT:
 
 
 def render_classification_mode():
-    st.markdown('<div class="step-label">1 · Upload contracts</div>', unsafe_allow_html=True)
-    uploaded_files = st.file_uploader(
-        "PDF files", type=["pdf"], accept_multiple_files=True,
-        label_visibility="collapsed", key="classification_uploader",
-    )
+    pdf_bytes_map = st.session_state.get("pdf_bytes", {})
+
+    if not pdf_bytes_map:
+        st.info(
+            "No contracts loaded yet. Upload and run extraction in **Contract Audit** mode first — "
+            "Classification mode automatically reuses those same files."
+        )
+        return
+
+    st.markdown('<div class="step-label">Contracts loaded from Contract Audit</div>', unsafe_allow_html=True)
+    st.caption(", ".join(pdf_bytes_map.keys()))
 
     if "classification_results" not in st.session_state:
         st.session_state.classification_results = None
 
-    st.markdown('<div class="step-label">2 · Classify</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-label">Classify</div>', unsafe_allow_html=True)
     if st.button(
         "Classify contracts",
         type="primary",
-        disabled=not (uploaded_files and OPENAI_API_KEY),
+        disabled=not OPENAI_API_KEY,
     ):
         results = []
+        file_names = list(pdf_bytes_map.keys())
         progress = st.progress(0.0, text="Starting...")
 
-        for idx, file in enumerate(uploaded_files):
-            progress.progress(idx / len(uploaded_files), text=f"Reading {file.name}...")
+        for idx, file_name in enumerate(file_names):
+            progress.progress(idx / len(file_names), text=f"Reading {file_name}...")
             try:
-                text = extract_pdf_text(file)
+                text = extract_pdf_text(io.BytesIO(pdf_bytes_map[file_name]))
             except Exception as e:
-                results.append({"file": file.name, "error": f"Failed to read PDF: {e}"})
+                results.append({"file": file_name, "error": f"Failed to read PDF: {e}"})
                 continue
 
             if not text.strip():
-                results.append({"file": file.name, "error": "No extractable text (likely a scanned/image PDF)"})
+                results.append({"file": file_name, "error": "No extractable text (likely a scanned/image PDF)"})
                 continue
 
             prompt = build_classification_prompt(text[:MAX_CHARS])
-            progress.progress((idx + 0.5) / len(uploaded_files), text=f"Classifying {file.name}...")
+            progress.progress((idx + 0.5) / len(file_names), text=f"Classifying {file_name}...")
             try:
                 raw = call_openai(prompt, OPENAI_API_KEY, OPENAI_MODEL)
             except Exception as e:
-                results.append({"file": file.name, "error": f"Classification failed: {e}"})
+                results.append({"file": file_name, "error": f"Classification failed: {e}"})
                 continue
 
             parsed = parse_json_response(raw)
             if "error" in parsed:
-                results.append({"file": file.name, "error": parsed["error"]})
+                results.append({"file": file_name, "error": parsed["error"]})
                 continue
 
             results.append({
-                "file": file.name,
+                "file": file_name,
                 "pricing_classification": parsed.get("pricing_classification", "Not found"),
                 "category": parsed.get("category", "") if parsed.get("category") in CLASSIFICATION_CATEGORIES else "",
                 "category_reasoning": parsed.get("category_reasoning", ""),
