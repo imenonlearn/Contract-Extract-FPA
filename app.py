@@ -501,6 +501,12 @@ def render_audit_mode():
         type="primary",
         disabled=not (uploaded_files and active_fields and OPENAI_API_KEY),
     ):
+        # Clear any stale manual overrides from a previous extraction run —
+        # row indices reset each run, so leftover overrides could apply to the wrong row.
+        for k in list(st.session_state.keys()):
+            if k.startswith("override_"):
+                del st.session_state[k]
+
         rows = []
         source_items = {}
         pdf_bytes_map = {}
@@ -542,26 +548,62 @@ def render_audit_mode():
         st.session_state.pdf_bytes = pdf_bytes_map
         st.session_state.selected_source = None
         st.session_state.truncation_warnings = truncation_warnings
+        st.session_state.reviewable_columns = [f["name"] for f in active_fields]
 
     if st.session_state.results is not None:
         if st.session_state.get("truncation_warnings"):
             for w in st.session_state.truncation_warnings:
                 st.warning(f"⚠️ {w} — terms appearing later in the document may have been missed.")
 
+        # Apply any reviewer edits — every cell (except File) can be corrected,
+        # not just ones the model marked "Not found" — so both the table and
+        # the Excel export always reflect the reviewer's current word on it.
+        display_df = st.session_state.results.copy()
+        editable_cols = [c for c in display_df.columns if c not in ("File", "Error")]
+        for row_idx in display_df.index:
+            for col in editable_cols:
+                override_key = f"override_{row_idx}_{col}"
+                if override_key in st.session_state:
+                    display_df.at[row_idx, col] = st.session_state[override_key]
+
         st.markdown('<div class="step-label">Results</div>', unsafe_allow_html=True)
         st.markdown(
-            st.session_state.results.to_html(index=False, escape=False, na_rep=""),
+            display_df.to_html(index=False, escape=False, na_rep=""),
             unsafe_allow_html=True,
         )
 
         buffer = io.BytesIO()
-        st.session_state.results.to_excel(buffer, index=False, engine="openpyxl")
+        display_df.to_excel(buffer, index=False, engine="openpyxl")
         st.download_button(
             "Download as Excel",
             data=buffer.getvalue(),
             file_name="contract_key_terms.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+        # -----------------------------------------------------------------
+        # Edit values — expand a row to correct anything, not just blanks
+        # -----------------------------------------------------------------
+        st.markdown('<div class="step-label">Edit values</div>', unsafe_allow_html=True)
+        st.caption("Open a row to correct any value — whether it's missing or you simply disagree with what was extracted. Changes apply to the table and Excel export immediately.")
+        for row_idx in display_df.index:
+            file_label = display_df.at[row_idx, "File"] if "File" in display_df.columns else f"Row {row_idx}"
+            channel_val = display_df.at[row_idx, "Channel"] if "Channel" in display_df.columns else None
+            channel_suffix = f" — {channel_val}" if channel_val and str(channel_val).strip() else ""
+            has_missing = any(
+                str(st.session_state.results.at[row_idx, c]).strip().lower() == "not found"
+                for c in editable_cols if c in st.session_state.results.columns
+            )
+            with st.expander(f"{file_label}{channel_suffix}" + ("  ⚠️ has missing values" if has_missing else "")):
+                for col in editable_cols:
+                    if col not in display_df.columns:
+                        continue
+                    override_key = f"override_{row_idx}_{col}"
+                    st.text_input(
+                        col,
+                        value=str(st.session_state.results.at[row_idx, col]),
+                        key=override_key,
+                    )
 
         # -----------------------------------------------------------------
         # Verify a value against its source in the PDF
