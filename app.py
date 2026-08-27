@@ -927,10 +927,12 @@ def parse_duration_months(term_text, effective_date=None):
     if not term_text or str(term_text).strip().lower() == "not found":
         return None
     text = str(term_text).lower()
-    m = re.search(r"(\d+)\s*year", text)
+    # \D{0,3} tolerates a closing paren/space between the digit and the unit word,
+    # e.g. "two (2) years" — the digit isn't immediately followed by "year".
+    m = re.search(r"(\d+)\D{0,3}year", text)
     if m:
         return int(m.group(1)) * 12
-    m = re.search(r"(\d+)\s*month", text)
+    m = re.search(r"(\d+)\D{0,3}month", text)
     if m:
         return int(m.group(1))
     end_date = parse_date_flexible(term_text)
