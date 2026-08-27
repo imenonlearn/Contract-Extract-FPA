@@ -1013,17 +1013,18 @@ def compute_prorated_budget(contract_value, effective_date, duration_months, cal
     monthly_rate = contract_value / duration_months
     year_start = pd.Timestamp(year=calendar_year, month=1, day=1)
     year_end = pd.Timestamp(year=calendar_year, month=12, day=31)
-    contract_end = effective_date + pd.DateOffset(months=duration_months)
-    active_start = max(effective_date, year_start)
-    active_end_excl = min(contract_end, year_end + pd.Timedelta(days=1))
-    if active_end_excl <= active_start:
-        return 0.0, monthly_rate, []
-    months_active = []
-    cursor = pd.Timestamp(year=active_start.year, month=active_start.month, day=1)
-    while cursor < active_end_excl and cursor <= year_end:
-        if cursor >= year_start:
-            months_active.append(cursor.month)
+
+    # Walk the contract's own calendar months from its start — capped at exactly
+    # duration_months entries, since a contract stated as "N months" should
+    # produce exactly N monthly periods, even if its exact end date spills a
+    # few days into what would otherwise look like an (N+1)th month.
+    all_contract_months = []
+    cursor = pd.Timestamp(year=effective_date.year, month=effective_date.month, day=1)
+    for _ in range(duration_months):
+        all_contract_months.append((cursor.year, cursor.month))
         cursor += pd.DateOffset(months=1)
+
+    months_active = [m for (y, m) in all_contract_months if y == calendar_year]
     total = monthly_rate * len(months_active)
     return total, monthly_rate, months_active
 
