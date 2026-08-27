@@ -952,13 +952,61 @@ def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, f
     return buf.getvalue()
 
 
+def render_actuals_upload_mode():
+    st.caption("Upload a transaction-level actuals export here — Forecasting mode will automatically use it instead of the budget file's own month columns.")
+
+    existing = st.session_state.get("actuals_dump_mapping")
+    if existing:
+        df_dump, date_col, dump_name_col, amount_col = existing
+        st.success(f"Actuals dump loaded — {len(df_dump):,} rows, matched on '{dump_name_col}' with amounts from '{amount_col}'.")
+        if st.button("Clear uploaded actuals dump"):
+            st.session_state.pop("actuals_dump_mapping", None)
+            st.rerun()
+        st.markdown('<div class="step-label">Replace it</div>', unsafe_allow_html=True)
+
+    dump_file = st.file_uploader("Actuals dump (.xlsx or .csv)", type=["xlsx", "csv"], key="actuals_dump_file")
+
+    if not dump_file:
+        if not existing:
+            st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount.")
+        return
+
+    try:
+        if dump_file.name.lower().endswith(".csv"):
+            df_dump = pd.read_csv(dump_file)
+        else:
+            df_dump = pd.read_excel(dump_file, engine="openpyxl")
+    except Exception as e:
+        st.error(f"Couldn't read this file: {e}")
+        return
+
+    if df_dump.empty:
+        st.warning("This file appears to be empty.")
+        return
+
+    st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
+    dump_columns = list(df_dump.columns)
+    guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
+    guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
+    guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
+
+    dc1, dc2, dc3 = st.columns(3)
+    date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
+    dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
+    amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
+
+    st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
+    st.caption("Matched against your budget file's line items by name in Forecasting mode — go there once you're happy with the mapping above.")
+
+
 def render_forecast_mode():
     st.caption("This mode does pure arithmetic — no AI, no API calls, no cost.")
 
-    use_dump = st.toggle(
-        "Upload a separate actuals dump (transaction-level export) instead of using the budget file's own month columns",
-        value=False,
-    )
+    dump_mapping = st.session_state.get("actuals_dump_mapping")
+    if dump_mapping:
+        st.info(f"Using actuals from your uploaded dump ({len(dump_mapping[0]):,} rows) — see the **Actuals Upload** tab to change or clear it.")
+    else:
+        st.caption("No actuals dump uploaded — using the budget file's own month columns. Switch to the **Actuals Upload** tab to use a transaction-level export instead.")
 
     st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
     budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="budget_file")
@@ -1000,41 +1048,7 @@ def render_forecast_mode():
             picked = st.selectbox(month, options, index=options.index(default), key=f"month_col_{i}", label_visibility="visible")
         month_cols.append(None if picked == "(none)" else picked)
 
-    actuals_lookup = None
-    if use_dump:
-        st.markdown('<div class="step-label">3 · Upload actuals dump</div>', unsafe_allow_html=True)
-        st.caption("A transaction-level export — one row per transaction, with a date, a line-item name, and an amount. Matched to your budget lines by name.")
-        dump_file = st.file_uploader("Actuals dump (.xlsx or .csv)", type=["xlsx", "csv"], key="actuals_dump_file")
-
-        if dump_file:
-            try:
-                if dump_file.name.lower().endswith(".csv"):
-                    df_dump = pd.read_csv(dump_file)
-                else:
-                    df_dump = pd.read_excel(dump_file, engine="openpyxl")
-            except Exception as e:
-                st.error(f"Couldn't read this file: {e}")
-                df_dump = None
-
-            if df_dump is not None and not df_dump.empty:
-                dump_columns = list(df_dump.columns)
-                guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
-                guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
-                guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
-
-                dc1, dc2, dc3 = st.columns(3)
-                date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
-                dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
-                amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
-
-                st.session_state["_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
-            else:
-                st.session_state.pop("_dump_mapping", None)
-        else:
-            st.info("Upload the actuals dump to continue, or turn off the toggle above to use the budget file's own month columns instead.")
-            st.session_state.pop("_dump_mapping", None)
-
-    st.markdown('<div class="step-label">4 · Forecast settings</div>' if use_dump else '<div class="step-label">3 · Forecast settings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-label">3 · Forecast settings</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     year = c1.number_input("Forecast year (calendar year, starts January)", min_value=2020, max_value=2100, value=2026, step=1)
     through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=7)
@@ -1044,16 +1058,14 @@ def render_forecast_mode():
         if not budget_col or budget_col not in df.columns:
             st.error("Please select a valid annual budget column.")
             return
-        if use_dump:
-            if "_dump_mapping" not in st.session_state:
-                st.error("Please upload and map an actuals dump first, or turn off the toggle above.")
-                return
-            df_dump, date_col, dump_name_col, amount_col = st.session_state["_dump_mapping"]
+
+        actuals_lookup = None
+        if dump_mapping:
+            df_dump, date_col, dump_name_col, amount_col = dump_mapping
             actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
-        else:
-            if all(c is None for c in month_cols):
-                st.error("At least one month column needs to be mapped.")
-                return
+        elif all(c is None for c in month_cols):
+            st.error("At least one month column needs to be mapped.")
+            return
 
         forecast_rows = compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx, actuals_lookup)
         workbook_bytes = build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year, actuals_lookup)
@@ -1081,7 +1093,7 @@ def render_forecast_mode():
 # ---------------------------------------------------------------------------
 mode = st.radio(
     "Mode",
-    ["Contract Audit", "Contract Classification", "Forecasting"],
+    ["Contract Audit", "Contract Classification", "Actuals Upload", "Forecasting"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -1091,5 +1103,7 @@ if mode == "Contract Audit":
     render_audit_mode()
 elif mode == "Contract Classification":
     render_classification_mode()
+elif mode == "Actuals Upload":
+    render_actuals_upload_mode()
 else:
     render_forecast_mode()
