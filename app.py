@@ -1087,7 +1087,13 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
             ws.cell(row=row, column=2).value = round(ins["prorated_total"], 2) if ins["prorated_total"] else 0
             for m in range(1, 13):
                 col = MONTH_COL_START + (m - 1)
-                ws.cell(row=row, column=col).value = round(ins["monthly_rate"], 2) if m in ins["active_months"] else 0
+                ins_monthly_values = ins.get("monthly_values") or {}
+                if m in ins_monthly_values:
+                    ws.cell(row=row, column=col).value = round(ins_monthly_values[m], 2)
+                elif m in ins["active_months"]:
+                    ws.cell(row=row, column=col).value = round(ins["monthly_rate"], 2)
+                else:
+                    ws.cell(row=row, column=col).value = 0
 
         # Recompute the hierarchy now that rows have shifted, and rewrite rollup formulas.
         nodes = build_sheet_structure(ws)
@@ -1133,8 +1139,9 @@ def render_actuals_upload_mode():
 
     existing = st.session_state.get("actuals_dump_mapping")
     if existing:
-        df_dump, date_col, dump_name_col, amount_col = existing
-        st.success(f"Actuals dump loaded — {len(df_dump):,} rows, matched on '{dump_name_col}' with amounts from '{amount_col}'.")
+        df_dump, date_col, dump_name_col, amount_col, account_col = existing
+        account_note = f", account name from '{account_col}'" if account_col else ""
+        st.success(f"Actuals dump loaded — {len(df_dump):,} rows, matched on '{dump_name_col}' with amounts from '{amount_col}'{account_note}.")
         if st.button("Clear uploaded actuals dump"):
             st.session_state.pop("actuals_dump_mapping", None)
             st.rerun()
@@ -1163,20 +1170,76 @@ def render_actuals_upload_mode():
             guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
             guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
             guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
+            guessed_account = guess_column(dump_columns, ["account"])
 
-            dc1, dc2, dc3 = st.columns(3)
+            dc1, dc2, dc3, dc4 = st.columns(4)
             date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
             dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
             amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
+            account_options = ["(none)"] + dump_columns
+            account_default = guessed_account if guessed_account in dump_columns else "(none)"
+            account_picked = dc4.selectbox("Account Name column", account_options, index=account_options.index(account_default))
+            account_col = None if account_picked == "(none)" else account_picked
 
-            st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
+            st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col, account_col)
             st.caption("Matched against your budget file's line items by name in Forecasting mode.")
 
     st.markdown('<div class="step-label">Continue</div>', unsafe_allow_html=True)
     if st.button("Continue to Forecasting →", type="primary"):
+        mapping = st.session_state.get("actuals_dump_mapping")
+        if mapping:
+            df_dump, date_col, dump_name_col, amount_col, account_col = mapping
+            if account_col:
+                names = df_dump[account_col].dropna().astype(str).str.strip()
+                st.session_state.confirmed_account_names = sorted(set(n for n in names if n))
+            else:
+                st.session_state.confirmed_account_names = []
+        else:
+            st.session_state.confirmed_account_names = []
         st.session_state.wizard_step = 4
         st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 4)
         st.rerun()
+
+
+def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, counterparty_norm, through_month_idx):
+    """Blends real actuals (from the dump) with a reforecast for the remaining
+    contract period. 'Remaining period' only counts months that actually have
+    a recorded actual — sensible for instalment-based contracts where most
+    months have no scheduled payment at all.
+
+    Returns (total_for_year, new_monthly_rate, active_months, monthly_values)
+    where monthly_values is {month_num: value_to_use} for every active month —
+    the real actual where one's on record through the chosen month, the
+    reforecast rate everywhere else."""
+    _, flat_rate, active_months = compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year)
+    if not active_months or flat_rate is None:
+        return None, None, [], {}
+
+    if not actuals_lookup:
+        monthly_values = {m: flat_rate for m in active_months}
+        return flat_rate * len(active_months), flat_rate, active_months, monthly_values
+
+    monthly_values = {}
+    months_with_actual = []
+    cumulative_actual = 0.0
+    for m in active_months:
+        if m <= through_month_idx:
+            actual_val = actuals_lookup.get((counterparty_norm, m))
+            if actual_val is not None:
+                monthly_values[m] = actual_val
+                months_with_actual.append(m)
+                cumulative_actual += actual_val
+
+    remaining_period = max(duration_months - len(months_with_actual), 1)
+    remaining_budget = contract_value - cumulative_actual
+    new_monthly_rate = remaining_budget / remaining_period
+
+    for m in active_months:
+        if m not in monthly_values:
+            monthly_values[m] = new_monthly_rate
+
+    total_for_year = sum(monthly_values.values())
+    return total_for_year, new_monthly_rate, active_months, monthly_values
 
 
 def render_forecast_mode():
@@ -1202,6 +1265,23 @@ def render_forecast_mode():
         return
 
     year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1)
+
+    dump_mapping = st.session_state.get("actuals_dump_mapping")
+    actuals_lookup = None
+    through_month_idx = 12
+    if dump_mapping:
+        df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
+        match_col = account_col or dump_name_col
+        actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, match_col, amount_col, year)
+        through_month = st.selectbox(
+            "Actuals known through month",
+            MONTH_NAMES,
+            index=0,
+            help="For each contract, months up to and including this one use the real actual from your uploaded dump where one exists; the remaining budget is then re-spread over whatever contract months are left.",
+        )
+        through_month_idx = MONTH_NAMES.index(through_month) + 1
+    else:
+        st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
 
     # Build the sheet structure once so we can match categories to real sheets and show existing headings.
     sheet_data = {}
@@ -1361,7 +1441,9 @@ def render_forecast_mode():
                         value = entered
                         st.session_state[f"override_{row_idx}_Contract Value"] = str(entered)
 
-                total, monthly_rate_calc, active_months = compute_prorated_budget(value, eff_date, duration, year)
+                total, monthly_rate_calc, active_months, monthly_values = compute_reforecast(
+                    value, eff_date, duration, year, actuals_lookup, normalize_name(item["counterparty"]), through_month_idx
+                )
 
                 still_missing = []
                 if eff_date is None:
@@ -1388,6 +1470,13 @@ def render_forecast_mode():
                     default_s_idx = sub_names.index(item["suggested_subheading"]) if item["suggested_subheading"] in sub_names else 0
                     chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
 
+                account_names = st.session_state.get("confirmed_account_names") or []
+                chosen_account_name = ""
+                if account_names:
+                    account_options = ["(none)"] + account_names
+                    chosen_account_name = st.selectbox("Account Name (from Actuals Upload)", account_options, index=0, key=f"plan_account_{item['file']}")
+                    chosen_account_name = "" if chosen_account_name == "(none)" else chosen_account_name
+
                 default_total = round(total, 2) if total is not None else 0.0
                 # Key includes the freshly computed default so any correction above —
                 # or one made back in Audit mode's "Edit values" panel — shows up here
@@ -1397,16 +1486,32 @@ def render_forecast_mode():
                     f"Budgeted amount for {year} (pro-rated)", value=default_total, key=amount_key
                 )
                 active_months = active_months or []
-                months_left = len(active_months) if active_months else 0
-                monthly_rate = (reviewer_total / months_left) if months_left else 0.0
-                st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate:,.2f}/month")
+                monthly_values = monthly_values or {}
+                # If the reviewer overrode the total, rescale the monthly breakdown
+                # proportionally so the Excel write-out still sums to what they typed.
+                if monthly_values and total and abs(reviewer_total - total) > 0.01:
+                    scale = reviewer_total / total
+                    monthly_values = {m: v * scale for m, v in monthly_values.items()}
+
+                if actuals_lookup and monthly_values:
+                    chosen_val = monthly_values.get(through_month_idx)
+                    is_actual = chosen_val is not None and actuals_lookup.get((normalize_name(item["counterparty"]), through_month_idx)) == chosen_val
+                    if is_actual:
+                        st.caption(f"{MONTH_NAMES[through_month_idx-1]} uses the recorded actual: {chosen_val:,.2f}. Remaining months reforecast at ~{monthly_rate_calc:,.2f}/month.")
+                    else:
+                        st.caption(f"No actual recorded yet for {item['counterparty']} — using the flat rate ~{monthly_rate_calc:,.2f}/month.")
+                else:
+                    months_left = len(active_months) if active_months else 0
+                    st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate_calc:,.2f}/month" if monthly_rate_calc else "")
 
                 plan_by_sheet.setdefault(item["category"], []).append({
                     "counterparty": item["counterparty"],
                     "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
                     "prorated_total": reviewer_total,
-                    "monthly_rate": monthly_rate,
+                    "monthly_rate": monthly_rate_calc or 0.0,
                     "active_months": active_months or list(range(1, 13)),
+                    "monthly_values": monthly_values,
+                    "account_name": chosen_account_name,
                 })
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
