@@ -1240,61 +1240,73 @@ def render_forecast_mode():
         return
 
     plan_by_sheet = {}
+    grouped_plan = {}
     for item in plan:
-        label = f"{item.get('counterparty', item['file'])} — {item['category']}"
-        with st.expander(label):
-            if item["status"] == "no_sheet":
-                st.warning(f"No sheet named '{item['category']}' in this workbook — can't place this contract.")
-                continue
-            if item["status"] == "no_audit_data":
-                st.warning("No matching Contract Audit results found for this file.")
-                continue
-            if item["status"] == "no_counterparty":
-                st.warning("Counterparty wasn't found in Contract Audit — fix that in Audit mode's 'Edit values' first.")
-                continue
-            if item["status"] == "already_present":
-                loc = item["existing_heading"] + (f" → {item['existing_subheading']}" if item["existing_subheading"] else "")
-                st.success(f"Already in the budget under **{loc}** — no new line will be added.")
-                continue
+        grouped_plan.setdefault(item["category"], []).append(item)
 
-            # status == "new"
-            issues = []
-            if item["effective_date"] is None:
-                issues.append("Effective Date")
-            if item["duration_months"] is None:
-                issues.append("Term / Expiry")
-            if item["contract_value"] is None:
-                issues.append("Contract Value")
-            if issues:
-                st.warning(f"Couldn't parse: {', '.join(issues)} — enter the prorated amount manually below.")
+    for category in CATEGORY_ABBREVIATIONS:
+        items = grouped_plan.get(category)
+        if not items:
+            continue
+        category_label = f"{category} — {CLASSIFICATION_CATEGORIES.get(category, category)}  ({len(items)} contract{'s' if len(items) != 1 else ''})"
+        with st.expander(category_label, expanded=True):
+            for i, item in enumerate(items):
+                if i > 0:
+                    st.divider()
+                st.markdown(f"**{item.get('counterparty', item['file'])}**")
 
-            headings = sheet_data[item["category"]]["headings"]
-            heading_names = [h["name"] for h in headings]
-            default_h_idx = heading_names.index(item["suggested_heading"]) if item["suggested_heading"] in heading_names else 0
-            chosen_heading_name = st.selectbox("Heading", heading_names, index=default_h_idx, key=f"plan_heading_{item['file']}")
-            chosen_heading = next(h for h in headings if h["name"] == chosen_heading_name)
+                if item["status"] == "no_sheet":
+                    st.warning(f"No sheet named '{item['category']}' in this workbook — can't place this contract.")
+                    continue
+                if item["status"] == "no_audit_data":
+                    st.warning("No matching Contract Audit results found for this file.")
+                    continue
+                if item["status"] == "no_counterparty":
+                    st.warning("Counterparty wasn't found in Contract Audit — fix that in Audit mode's 'Edit values' first.")
+                    continue
+                if item["status"] == "already_present":
+                    loc = item["existing_heading"] + (f" → {item['existing_subheading']}" if item["existing_subheading"] else "")
+                    st.success(f"Already in the budget under **{loc}** — no new line will be added.")
+                    continue
 
-            chosen_subheading_name = ""
-            if chosen_heading["subheadings"]:
-                sub_names = [s["name"] for s in chosen_heading["subheadings"]]
-                default_s_idx = sub_names.index(item["suggested_subheading"]) if item["suggested_subheading"] in sub_names else 0
-                chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
+                # status == "new"
+                issues = []
+                if item["effective_date"] is None:
+                    issues.append("Effective Date")
+                if item["duration_months"] is None:
+                    issues.append("Term / Expiry")
+                if item["contract_value"] is None:
+                    issues.append("Contract Value")
+                if issues:
+                    st.warning(f"Couldn't parse: {', '.join(issues)} — enter the prorated amount manually below.")
 
-            default_total = round(item["prorated_total"], 2) if item["prorated_total"] is not None else 0.0
-            reviewer_total = st.number_input(
-                f"Budgeted amount for {year} (pro-rated)", value=default_total, key=f"plan_total_{item['file']}"
-            )
-            months_left = len(item["active_months"]) if item["active_months"] else 0
-            monthly_rate = (reviewer_total / months_left) if months_left else 0.0
-            st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate:,.2f}/month")
+                headings = sheet_data[item["category"]]["headings"]
+                heading_names = [h["name"] for h in headings]
+                default_h_idx = heading_names.index(item["suggested_heading"]) if item["suggested_heading"] in heading_names else 0
+                chosen_heading_name = st.selectbox("Heading", heading_names, index=default_h_idx, key=f"plan_heading_{item['file']}")
+                chosen_heading = next(h for h in headings if h["name"] == chosen_heading_name)
 
-            plan_by_sheet.setdefault(item["category"], []).append({
-                "counterparty": item["counterparty"],
-                "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
-                "prorated_total": reviewer_total,
-                "monthly_rate": monthly_rate,
-                "active_months": item["active_months"] or list(range(1, 13)),
-            })
+                chosen_subheading_name = ""
+                if chosen_heading["subheadings"]:
+                    sub_names = [s["name"] for s in chosen_heading["subheadings"]]
+                    default_s_idx = sub_names.index(item["suggested_subheading"]) if item["suggested_subheading"] in sub_names else 0
+                    chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
+
+                default_total = round(item["prorated_total"], 2) if item["prorated_total"] is not None else 0.0
+                reviewer_total = st.number_input(
+                    f"Budgeted amount for {year} (pro-rated)", value=default_total, key=f"plan_total_{item['file']}"
+                )
+                months_left = len(item["active_months"]) if item["active_months"] else 0
+                monthly_rate = (reviewer_total / months_left) if months_left else 0.0
+                st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate:,.2f}/month")
+
+                plan_by_sheet.setdefault(item["category"], []).append({
+                    "counterparty": item["counterparty"],
+                    "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
+                    "prorated_total": reviewer_total,
+                    "monthly_rate": monthly_rate,
+                    "active_months": item["active_months"] or list(range(1, 13)),
+                })
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
     if st.button("Apply to workbook", type="primary", disabled=not plan_by_sheet):
