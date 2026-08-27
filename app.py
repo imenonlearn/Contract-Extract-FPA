@@ -1208,7 +1208,7 @@ def render_forecast_mode():
         eff_date = parse_date_flexible(row.get("Effective Date"))
         duration = parse_duration_months(row.get("Term / Expiry"), eff_date)
         value = parse_amount(row.get("Contract Value"))
-        total, monthly_rate, active_months = compute_prorated_budget(value, eff_date, duration, year)
+        row_idx = file_rows.index[0]
 
         # Ask the model to suggest where this fits among the sheet's real headings.
         suggested_heading, suggested_subheading = None, ""
@@ -1234,9 +1234,8 @@ def render_forecast_mode():
 
         plan.append({
             "file": file_name, "category": category, "counterparty": counterparty,
-            "status": "new", "sheet": category,
+            "status": "new", "sheet": category, "row_idx": row_idx,
             "effective_date": eff_date, "duration_months": duration, "contract_value": value,
-            "prorated_total": total, "monthly_rate": monthly_rate, "active_months": active_months,
             "suggested_heading": suggested_heading, "suggested_subheading": suggested_subheading,
         })
 
@@ -1275,15 +1274,57 @@ def render_forecast_mode():
                     continue
 
                 # status == "new"
-                issues = []
-                if item["effective_date"] is None:
-                    issues.append("Effective Date")
-                if item["duration_months"] is None:
-                    issues.append("Term / Expiry")
-                if item["contract_value"] is None:
-                    issues.append("Contract Value")
-                if issues:
-                    st.warning(f"Couldn't parse: {', '.join(issues)} — enter the prorated amount manually below.")
+                row_idx = item["row_idx"]
+                eff_date = item["effective_date"]
+                duration = item["duration_months"]
+                value = item["contract_value"]
+
+                if eff_date is None:
+                    entered = st.text_input(
+                        "Effective Date wasn't found — enter it (e.g. '1 June 2026')",
+                        key=f"fix_effdate_{item['file']}",
+                    )
+                    if entered.strip():
+                        parsed_date = parse_date_flexible(entered)
+                        if parsed_date is not None:
+                            eff_date = parsed_date
+                            st.session_state[f"override_{row_idx}_Effective Date"] = entered.strip()
+                        else:
+                            st.caption("Couldn't read that as a date — try a format like '1 June 2026'.")
+
+                if duration is None:
+                    entered = st.text_input(
+                        "Term / Expiry wasn't found — enter it (e.g. '12 months')",
+                        key=f"fix_term_{item['file']}",
+                    )
+                    if entered.strip():
+                        parsed_duration = parse_duration_months(entered, eff_date)
+                        if parsed_duration is not None:
+                            duration = parsed_duration
+                            st.session_state[f"override_{row_idx}_Term / Expiry"] = entered.strip()
+                        else:
+                            st.caption("Couldn't read a duration from that — try '12 months' or '2 years'.")
+
+                if value is None:
+                    entered = st.number_input(
+                        "Contract Value wasn't found — enter the total contract value",
+                        min_value=0.0, value=0.0, key=f"fix_value_{item['file']}",
+                    )
+                    if entered > 0:
+                        value = entered
+                        st.session_state[f"override_{row_idx}_Contract Value"] = str(entered)
+
+                total, monthly_rate_calc, active_months = compute_prorated_budget(value, eff_date, duration, year)
+
+                still_missing = []
+                if eff_date is None:
+                    still_missing.append("Effective Date")
+                if duration is None:
+                    still_missing.append("Term / Expiry")
+                if value is None:
+                    still_missing.append("Contract Value")
+                if still_missing:
+                    st.warning(f"Still missing: {', '.join(still_missing)} — fill in above, or enter the budgeted amount manually below.")
 
                 headings = sheet_data[item["category"]]["headings"]
                 heading_names = [h["name"] for h in headings]
@@ -1297,16 +1338,16 @@ def render_forecast_mode():
                     default_s_idx = sub_names.index(item["suggested_subheading"]) if item["suggested_subheading"] in sub_names else 0
                     chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
 
-                default_total = round(item["prorated_total"], 2) if item["prorated_total"] is not None else 0.0
-                # Key includes the freshly computed default so a correction to
-                # Effective Date / Term / Contract Value in Audit mode — which changes
-                # this default — shows up here automatically instead of being stuck
-                # on whatever was typed the first time this box was ever shown.
+                default_total = round(total, 2) if total is not None else 0.0
+                # Key includes the freshly computed default so any correction above —
+                # or one made back in Audit mode's "Edit values" panel — shows up here
+                # immediately instead of the box being stuck on an old value.
                 amount_key = f"plan_total_{item['file']}_{default_total}"
                 reviewer_total = st.number_input(
                     f"Budgeted amount for {year} (pro-rated)", value=default_total, key=amount_key
                 )
-                months_left = len(item["active_months"]) if item["active_months"] else 0
+                active_months = active_months or []
+                months_left = len(active_months) if active_months else 0
                 monthly_rate = (reviewer_total / months_left) if months_left else 0.0
                 st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate:,.2f}/month")
 
@@ -1315,7 +1356,7 @@ def render_forecast_mode():
                     "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
                     "prorated_total": reviewer_total,
                     "monthly_rate": monthly_rate,
-                    "active_months": item["active_months"] or list(range(1, 13)),
+                    "active_months": active_months or list(range(1, 13)),
                 })
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
