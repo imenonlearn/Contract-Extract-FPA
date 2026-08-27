@@ -116,6 +116,11 @@ if "fields" not in st.session_state:
 if "results" not in st.session_state:
     st.session_state.results = None
 
+if "wizard_step" not in st.session_state:
+    st.session_state.wizard_step = 1
+if "max_unlocked_step" not in st.session_state:
+    st.session_state.max_unlocked_step = 1
+
 
 # ---------------------------------------------------------------------------
 # API key resolution — env var (.env) first, then Streamlit Secrets
@@ -521,6 +526,11 @@ def render_audit_mode():
         for k in list(st.session_state.keys()):
             if k.startswith("override_"):
                 del st.session_state[k]
+        # A fresh extraction invalidates any downstream confirmed snapshots —
+        # force re-confirmation through Classification and Forecasting.
+        st.session_state.pop("confirmed_audit_df", None)
+        st.session_state.pop("confirmed_classification", None)
+        st.session_state.max_unlocked_step = 1
 
         rows = []
         source_items = {}
@@ -658,6 +668,18 @@ def render_audit_mode():
                                 st.info(f"Couldn't pinpoint this on the page. Quoted text: \u201c{item['quote']}\u201d")
                         else:
                             st.caption("Select a value on the left to preview its source here.")
+
+        st.markdown('<div class="step-label">Confirm</div>', unsafe_allow_html=True)
+        st.caption("Locks in the table above — including any manual corrections — as the data every later step will use.")
+        if st.button("✅ Confirm & Continue to Classification", type="primary"):
+            st.session_state.confirmed_audit_df = apply_reviewer_overrides(st.session_state.results).copy()
+            st.session_state.wizard_step = 2
+            st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 2)
+            st.rerun()
+
+        if st.session_state.get("confirmed_audit_df") is not None:
+            st.success("Confirmed ✓ — Classification and Forecasting will use this snapshot until you confirm again.")
+
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 
@@ -819,6 +841,21 @@ def render_classification_mode():
         file_name="contract_classification.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    st.markdown('<div class="step-label">Confirm</div>', unsafe_allow_html=True)
+    st.caption("Locks in each contract's final category above — including any reviewer overrides — for Forecasting to use.")
+    if st.button("✅ Confirm & Continue", type="primary"):
+        st.session_state.confirmed_classification = [
+            {"file": r["File"], "category": r["Reviewer Classification"]}
+            for r in export_rows if r.get("Reviewer Classification")
+        ]
+        st.session_state.wizard_step = 3
+        st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 3)
+        st.rerun()
+
+    if st.session_state.get("confirmed_classification") is not None:
+        st.success("Confirmed ✓ — Forecasting will use these categories until you confirm again.")
+
 def guess_column(columns, keywords):
     for col in columns:
         norm = str(col).strip().lower()
@@ -1092,7 +1129,7 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
 
 
 def render_actuals_upload_mode():
-    st.caption("Upload a transaction-level actuals export here — Forecasting mode will automatically use it instead of the budget file's own month columns.")
+    st.caption("Upload a transaction-level actuals export here — Forecasting mode will automatically use it instead of the budget file's own month columns. This step is optional — skip straight to Forecasting if you don't need it.")
 
     existing = st.session_state.get("actuals_dump_mapping")
     if existing:
@@ -1107,45 +1144,49 @@ def render_actuals_upload_mode():
 
     if not dump_file:
         if not existing:
-            st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount.")
-        return
+            st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount — or just continue if you don't have one.")
+    else:
+        try:
+            if dump_file.name.lower().endswith(".csv"):
+                df_dump = pd.read_csv(dump_file)
+            else:
+                df_dump = pd.read_excel(dump_file, engine="openpyxl")
+        except Exception as e:
+            st.error(f"Couldn't read this file: {e}")
+            df_dump = None
 
-    try:
-        if dump_file.name.lower().endswith(".csv"):
-            df_dump = pd.read_csv(dump_file)
-        else:
-            df_dump = pd.read_excel(dump_file, engine="openpyxl")
-    except Exception as e:
-        st.error(f"Couldn't read this file: {e}")
-        return
+        if df_dump is not None and df_dump.empty:
+            st.warning("This file appears to be empty.")
+        elif df_dump is not None:
+            st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
+            dump_columns = list(df_dump.columns)
+            guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
+            guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
+            guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
 
-    if df_dump.empty:
-        st.warning("This file appears to be empty.")
-        return
+            dc1, dc2, dc3 = st.columns(3)
+            date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
+            dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
+            amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
 
-    st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
-    dump_columns = list(df_dump.columns)
-    guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
-    guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
-    guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
+            st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
+            st.caption("Matched against your budget file's line items by name in Forecasting mode.")
 
-    dc1, dc2, dc3 = st.columns(3)
-    date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
-    dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
-    amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
-
-    st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
-    st.caption("Matched against your budget file's line items by name in Forecasting mode — go there once you're happy with the mapping above.")
+    st.markdown('<div class="step-label">Continue</div>', unsafe_allow_html=True)
+    if st.button("Continue to Forecasting →", type="primary"):
+        st.session_state.wizard_step = 4
+        st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 4)
+        st.rerun()
 
 
 def render_forecast_mode():
     st.caption("Adds new contracts into your Hub71 budget template, pro-rated for the months remaining in the calendar year, and keeps every heading/subheading/grand-total roll-up in sync.")
 
-    if st.session_state.results is None:
-        st.info("Run **Contract Audit** first — Forecasting needs the Counterparty, Effective Date, Term, and Contract Value from there.")
+    if st.session_state.get("confirmed_audit_df") is None:
+        st.info("Complete and **Confirm** Contract Audit first — Forecasting reads the confirmed snapshot, not live edits.")
         return
-    if not st.session_state.get("classification_results"):
-        st.info("Run **Contract Classification** first — Forecasting uses the category (HC/CO/CS/GS/MM) to pick the right sheet for each contract.")
+    if not st.session_state.get("confirmed_classification"):
+        st.info("Complete and **Confirm** Contract Classification first — Forecasting reads the confirmed snapshot, not live edits.")
         return
 
     st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
@@ -1170,18 +1211,16 @@ def render_forecast_mode():
         headings, line_item_index, total_row = get_hierarchy(nodes)
         sheet_data[sheet_name] = {"headings": headings, "line_item_index": line_item_index, "total_row": total_row}
 
-    audit_df = apply_reviewer_overrides(st.session_state.results)
+    audit_df = st.session_state.confirmed_audit_df
     pdf_bytes_map = st.session_state.get("pdf_bytes", {})
 
     st.markdown('<div class="step-label">2 · Review planned changes</div>', unsafe_allow_html=True)
 
     plan = []  # list of dicts, one per contract needing a decision
-    for r in st.session_state.classification_results:
+    for r in st.session_state.confirmed_classification:
         file_name = r.get("file")
-        if "error" in r:
-            continue
         suggested_category = r.get("category", "")
-        category = st.session_state.get(f"reviewer_class_{file_name}", suggested_category)
+        category = suggested_category  # already the final reviewer-confirmed category
         if category not in sheet_data or sheet_data.get(category) is None:
             continue  # e.g. HC has no matching sheet in this workbook
         if category not in wb.sheetnames:
@@ -1401,19 +1440,32 @@ def render_forecast_mode():
         )
         st.caption("Heading, subheading, and grand-total cells now contain live Excel SUM formulas, so the workbook stays fully editable.")
 
-mode = st.radio(
-    "Mode",
-    ["Contract Audit", "Contract Classification", "Actuals Upload", "Forecasting"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
+# ---------------------------------------------------------------------------
+# Wizard navigation — each step must be confirmed before the next unlocks
+# ---------------------------------------------------------------------------
+STEP_NAMES = {1: "1. Contract Audit", 2: "2. Contract Classification", 3: "3. Actuals Upload", 4: "4. Forecasting"}
+nav_cols = st.columns(4)
+for step_num, label in STEP_NAMES.items():
+    with nav_cols[step_num - 1]:
+        is_current = st.session_state.wizard_step == step_num
+        unlocked = step_num <= st.session_state.max_unlocked_step
+        if st.button(
+            ("▶ " if is_current else "") + label,
+            key=f"nav_step_{step_num}",
+            disabled=not unlocked,
+            use_container_width=True,
+            type="primary" if is_current else "secondary",
+        ):
+            st.session_state.wizard_step = step_num
+            st.rerun()
+
 st.markdown("<div style='height: 0.5rem'></div>", unsafe_allow_html=True)
 
-if mode == "Contract Audit":
+if st.session_state.wizard_step == 1:
     render_audit_mode()
-elif mode == "Contract Classification":
+elif st.session_state.wizard_step == 2:
     render_classification_mode()
-elif mode == "Actuals Upload":
+elif st.session_state.wizard_step == 3:
     render_actuals_upload_mode()
 else:
     render_forecast_mode()
