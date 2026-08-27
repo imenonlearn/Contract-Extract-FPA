@@ -1210,6 +1210,11 @@ def render_forecast_mode():
         eff_date = parse_date_flexible(row.get("Effective Date"))
         duration = parse_duration_months(row.get("Term / Expiry"), eff_date)
         value = parse_amount(row.get("Contract Value"))
+        raw_debug = {
+            "Effective Date (raw)": row.get("Effective Date"),
+            "Term / Expiry (raw)": row.get("Term / Expiry"),
+            "Contract Value (raw)": row.get("Contract Value"),
+        }
         row_idx = file_rows.index[0]
 
         # Ask the model to suggest where this fits among the sheet's real headings.
@@ -1238,6 +1243,7 @@ def render_forecast_mode():
             "file": file_name, "category": category, "counterparty": counterparty,
             "status": "new", "sheet": category, "row_idx": row_idx,
             "effective_date": eff_date, "duration_months": duration, "contract_value": value,
+            "raw_debug": raw_debug,
             "suggested_heading": suggested_heading, "suggested_subheading": suggested_subheading,
         })
 
@@ -1327,6 +1333,9 @@ def render_forecast_mode():
                     still_missing.append("Contract Value")
                 if still_missing:
                     st.warning(f"Still missing: {', '.join(still_missing)} — fill in above, or enter the budgeted amount manually below.")
+                    with st.expander("Why? Show what was actually read from Contract Audit"):
+                        st.json(item.get("raw_debug", {}))
+                        st.caption("If a field above shows a real value but still says 'missing', it's a parsing issue — otherwise the correction in Audit mode isn't reaching this contract yet.")
 
                 headings = sheet_data[item["category"]]["headings"]
                 heading_names = [h["name"] for h in headings]
