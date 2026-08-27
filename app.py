@@ -20,6 +20,7 @@ import json
 import os
 import re
 
+import openpyxl
 import pandas as pd
 import pdfplumber
 import requests
@@ -166,6 +167,20 @@ def extract_pdf_text(file) -> str:
             page_text = page.extract_text() or ""
             text_parts.append(page_text)
     return "\n".join(text_parts)
+
+
+def apply_reviewer_overrides(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Applies any reviewer edits stored under override_{row}_{col} keys to a copy
+    of the audit results — used both for the on-screen table and anywhere else
+    (like Forecasting) that needs the reviewer's corrected values, not the raw model output."""
+    display_df = results_df.copy()
+    editable_cols = [c for c in display_df.columns if c not in ("File", "Error")]
+    for row_idx in display_df.index:
+        for col in editable_cols:
+            override_key = f"override_{row_idx}_{col}"
+            if override_key in st.session_state:
+                display_df.at[row_idx, col] = st.session_state[override_key]
+    return display_df
 
 
 def call_openai(prompt: str, api_key: str, model: str) -> str:
@@ -558,7 +573,7 @@ def render_audit_mode():
         # Apply any reviewer edits — every cell (except File) can be corrected,
         # not just ones the model marked "Not found" — so both the table and
         # the Excel export always reflect the reviewer's current word on it.
-        display_df = st.session_state.results.copy()
+        display_df = apply_reviewer_overrides(st.session_state.results)
         editable_cols = [c for c in display_df.columns if c not in ("File", "Error")]
         for row_idx in display_df.index:
             for col in editable_cols:
@@ -812,20 +827,6 @@ def guess_column(columns, keywords):
     return None
 
 
-def guess_month_columns(columns):
-    """Returns a list of 12 column names (or None) matching Jan..Dec by prefix."""
-    result = []
-    for month in MONTH_NAMES:
-        match = None
-        for col in columns:
-            norm = str(col).strip().lower()
-            if norm.startswith(month.lower()):
-                match = col
-                break
-        result.append(match)
-    return result
-
-
 def normalize_name(x) -> str:
     return str(x).strip().lower()
 
@@ -845,252 +846,440 @@ def build_monthly_actuals_lookup(df_dump, date_col, name_col, amount_col, year):
     return grouped.to_dict()
 
 
-def compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx, actuals_lookup=None):
-    """through_idx: number of months already actual (e.g. 8 = Jan-Aug are actuals).
-    If actuals_lookup is provided (from an uploaded actuals dump), it's used instead
-    of the budget file's own month columns. Returns a list of dicts per row."""
-    rows = []
-    for _, row in df.iterrows():
-        name = row[name_col]
-        try:
-            annual_budget = float(row[budget_col]) if pd.notna(row[budget_col]) else 0.0
-        except (TypeError, ValueError):
-            annual_budget = 0.0
-
-        actual_to_date = 0.0
-        for i in range(through_idx):
-            month_num = i + 1
-            if actuals_lookup is not None:
-                actual_to_date += actuals_lookup.get((normalize_name(name), month_num), 0.0)
-            else:
-                col = month_cols[i]
-                if col is None:
-                    continue
-                try:
-                    val = float(row[col]) if pd.notna(row[col]) else 0.0
-                except (TypeError, ValueError):
-                    val = 0.0
-                actual_to_date += val
-
-        remaining = annual_budget - actual_to_date
-        months_left = 12 - through_idx
-        monthly_forecast = (remaining / months_left) if months_left > 0 else 0.0
-
-        rows.append({
-            "name": name,
-            "annual_budget": annual_budget,
-            "actual_to_date": actual_to_date,
-            "remaining": remaining,
-            "months_left": months_left,
-            "monthly_forecast": monthly_forecast,
-        })
-    return rows
+CATEGORY_ABBREVIATIONS = list(CLASSIFICATION_CATEGORIES.keys())
 
 
-def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year, actuals_lookup=None) -> bytes:
-    """Writes an updated workbook: actual months unchanged, remaining months filled
-    with the evenly-spread forecast, with forecast cells highlighted. If actuals_lookup
-    is provided, elapsed-month values come from the dump instead of the budget file."""
-    from openpyxl import Workbook
-    from openpyxl.styles import PatternFill, Font
+def classify_row_color(cell) -> str:
+    """Returns 'purple' (heading), 'grey' (subheading), or 'plain' (line item),
+    based on the theme-based fill this budget template uses."""
+    fg = cell.fill.fgColor
+    if fg.type == "theme" and fg.theme == 8:
+        return "purple"
+    elif fg.type == "theme" and fg.theme == 0:
+        return "grey"
+    return "plain"
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"Forecast {year}"
 
-    forecast_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1F3A5F", end_color="1F3A5F", fill_type="solid")
+def build_sheet_structure(ws) -> list:
+    """Walks column A from row 3 onward (skipping the title and month-header rows)
+    and classifies each row as heading / subheading / line_item / total."""
+    nodes = []
+    for row in range(3, ws.max_row + 1):
+        cell = ws.cell(row=row, column=1)
+        name = cell.value
+        if name is None or (isinstance(name, str) and not name.strip()):
+            continue
+        color = classify_row_color(cell)
+        if isinstance(name, str) and name.strip().lower() == "total":
+            node_type = "total"
+        elif color == "purple":
+            node_type = "heading"
+        elif color == "grey":
+            node_type = "subheading"
+        else:
+            node_type = "line_item"
+        nodes.append({"type": node_type, "row": row, "name": name.strip() if isinstance(name, str) else name})
+    return nodes
 
-    headers = ["Line Item"] + MONTH_NAMES + ["Total", "Annual Budget", "Variance"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
 
-    monthly_totals = [0.0] * 12
-    budget_total = 0.0
+def get_hierarchy(nodes: list):
+    """Builds the heading -> subheading -> line_item tree, plus a flat
+    {normalized_line_item_name: (heading, subheading)} index for existence checks."""
+    headings = []
+    current_heading = None
+    current_subheading = None
+    line_item_index = {}
+    total_row = None
+    for node in nodes:
+        if node["type"] == "heading":
+            current_heading = {"name": node["name"], "row": node["row"], "subheadings": [], "direct_items": []}
+            headings.append(current_heading)
+            current_subheading = None
+        elif node["type"] == "subheading":
+            current_subheading = {"name": node["name"], "row": node["row"], "items": []}
+            if current_heading is not None:
+                current_heading["subheadings"].append(current_subheading)
+        elif node["type"] == "line_item":
+            key = normalize_name(node["name"])
+            heading_name = current_heading["name"] if current_heading else None
+            subheading_name = current_subheading["name"] if current_subheading else None
+            line_item_index[key] = (heading_name, subheading_name)
+            if current_subheading is not None:
+                current_subheading["items"].append(node)
+            elif current_heading is not None:
+                current_heading["direct_items"].append(node)
+        elif node["type"] == "total":
+            total_row = node["row"]
+    return headings, line_item_index, total_row
 
-    for i, fr in enumerate(forecast_rows):
-        row_values = [fr["name"]]
-        month_values = []
-        for m in range(12):
-            if m < through_idx:
-                if actuals_lookup is not None:
-                    val = actuals_lookup.get((normalize_name(fr["name"]), m + 1), 0.0)
-                else:
-                    col = month_cols[m]
-                    try:
-                        val = float(df.iloc[i][col]) if col is not None and pd.notna(df.iloc[i][col]) else 0.0
-                    except (TypeError, ValueError):
-                        val = 0.0
-            else:
-                val = round(fr["monthly_forecast"], 2)
-            month_values.append(val)
-            monthly_totals[m] += val
-        row_total = sum(month_values)
-        row_values += month_values
-        row_values += [row_total, fr["annual_budget"], row_total - fr["annual_budget"]]
-        ws.append(row_values)
-        budget_total += fr["annual_budget"]
 
-        excel_row = ws.max_row
-        for m in range(through_idx, 12):
-            ws.cell(row=excel_row, column=2 + m).fill = forecast_fill
+def parse_date_flexible(text):
+    if not text or str(text).strip().lower() in ("not found", ""):
+        return None
+    try:
+        result = pd.to_datetime(text, errors="coerce")
+        return None if pd.isna(result) else result
+    except Exception:
+        return None
 
-    total_row = ["TOTAL"] + [round(v, 2) for v in monthly_totals] + [round(sum(monthly_totals), 2), round(budget_total, 2), round(sum(monthly_totals) - budget_total, 2)]
-    ws.append(total_row)
-    for cell in ws[ws.max_row]:
-        cell.font = Font(bold=True)
 
-    for col_cells in ws.columns:
-        length = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
-        ws.column_dimensions[col_cells[0].column_letter].width = max(10, length + 2)
+def parse_duration_months(term_text, effective_date=None):
+    if not term_text or str(term_text).strip().lower() == "not found":
+        return None
+    text = str(term_text).lower()
+    m = re.search(r"(\d+)\s*year", text)
+    if m:
+        return int(m.group(1)) * 12
+    m = re.search(r"(\d+)\s*month", text)
+    if m:
+        return int(m.group(1))
+    end_date = parse_date_flexible(term_text)
+    if end_date is not None and effective_date is not None:
+        months = (end_date.year - effective_date.year) * 12 + (end_date.month - effective_date.month)
+        return max(months, 1)
+    return None
+
+
+def parse_amount(value_text):
+    if not value_text or str(value_text).strip().lower() == "not found":
+        return None
+    text = str(value_text).replace(",", "")
+    m = re.search(r"(\d+\.?\d*)", text)
+    return float(m.group(1)) if m else None
+
+
+def compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year):
+    """Returns (total_for_year, monthly_rate, [active_month_numbers]) or (None, None, []) if unparseable."""
+    if contract_value is None or effective_date is None or not duration_months:
+        return None, None, []
+    monthly_rate = contract_value / duration_months
+    year_start = pd.Timestamp(year=calendar_year, month=1, day=1)
+    year_end = pd.Timestamp(year=calendar_year, month=12, day=31)
+    contract_end = effective_date + pd.DateOffset(months=duration_months)
+    active_start = max(effective_date, year_start)
+    active_end_excl = min(contract_end, year_end + pd.Timedelta(days=1))
+    if active_end_excl <= active_start:
+        return 0.0, monthly_rate, []
+    months_active = []
+    cursor = pd.Timestamp(year=active_start.year, month=active_start.month, day=1)
+    while cursor < active_end_excl and cursor <= year_end:
+        if cursor >= year_start:
+            months_active.append(cursor.month)
+        cursor += pd.DateOffset(months=1)
+    total = monthly_rate * len(months_active)
+    return total, monthly_rate, months_active
+
+
+def build_placement_prompt(contract_text: str, headings: list) -> str:
+    heading_lines = []
+    for h in headings:
+        if h["subheadings"]:
+            subs = ", ".join(f'"{s["name"]}"' for s in h["subheadings"])
+            heading_lines.append(f'  - "{h["name"]}" (subheadings: {subs})')
+        else:
+            heading_lines.append(f'  - "{h["name"]}" (no subheadings — items sit directly under it)')
+    heading_block = "\n".join(heading_lines)
+    return f"""A new contract needs to be placed into one of the existing budget categories below.
+Read the contract text and pick the single best-fitting heading (and subheading, if that
+heading has any) based on what the contract is actually for.
+
+Existing categories:
+{heading_block}
+
+Return ONLY a JSON object of this shape:
+{{
+  "heading": "<one of the exact heading names above>",
+  "subheading": "<one of that heading's exact subheading names, or empty string if the heading has no subheadings>"
+}}
+
+CONTRACT TEXT:
+\"\"\"
+{contract_text}
+\"\"\"
+"""
+
+
+def find_insertion_row(heading: dict, subheading_name: str) -> int:
+    """Row just after the last existing item in the target group (or right after
+    the heading/subheading itself if that group has no items yet)."""
+    if subheading_name:
+        for sub in heading["subheadings"]:
+            if sub["name"] == subheading_name:
+                return (sub["items"][-1]["row"] + 1) if sub["items"] else (sub["row"] + 1)
+        return heading["row"] + 1
+    if heading["direct_items"]:
+        return heading["direct_items"][-1]["row"] + 1
+    if heading["subheadings"]:
+        last_sub = heading["subheadings"][-1]
+        return (last_sub["items"][-1]["row"] + 1) if last_sub["items"] else (last_sub["row"] + 1)
+    return heading["row"] + 1
+
+
+def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
+    """Inserts new line items per sheet (bottom-to-top so row numbers stay valid),
+    copies formatting from a neighboring line-item row, writes the prorated Budget
+    figure and its monthly spread, then rewrites SUM formulas for every
+    heading/subheading/grand-total row so the workbook stays a live, editable file."""
+    from openpyxl.utils import get_column_letter
+    import copy as _copy
+
+    MONTH_COL_START = 4  # column D = Jan
+
+    for sheet_name, insertions in plan_by_sheet.items():
+        if not insertions:
+            continue
+        ws = wb[sheet_name]
+
+        # Insert bottom-to-top so earlier insertion points aren't shifted by later ones.
+        for ins in sorted(insertions, key=lambda x: x["insertion_row"], reverse=True):
+            row = ins["insertion_row"]
+            ws.insert_rows(row, 1)
+            template_row = row - 1 if row > 1 else row + 1
+            for col in range(1, 17):
+                src = ws.cell(row=template_row, column=col)
+                dst = ws.cell(row=row, column=col)
+                dst.font = _copy.copy(src.font)
+                dst.fill = _copy.copy(src.fill)
+                dst.border = _copy.copy(src.border)
+                dst.number_format = src.number_format
+                dst.alignment = _copy.copy(src.alignment)
+
+            ws.cell(row=row, column=1).value = ins["counterparty"]
+            ws.cell(row=row, column=2).value = round(ins["prorated_total"], 2) if ins["prorated_total"] else 0
+            for m in range(1, 13):
+                col = MONTH_COL_START + (m - 1)
+                ws.cell(row=row, column=col).value = round(ins["monthly_rate"], 2) if m in ins["active_months"] else 0
+
+        # Recompute the hierarchy now that rows have shifted, and rewrite rollup formulas.
+        nodes = build_sheet_structure(ws)
+        headings, _, total_row = get_hierarchy(nodes)
+
+        heading_cell_refs = []
+        for h in headings:
+            if h["subheadings"]:
+                sub_refs = []
+                for sub in h["subheadings"]:
+                    if sub["items"]:
+                        first, last = sub["items"][0]["row"], sub["items"][-1]["row"]
+                        for col in [2] + list(range(4, 16)):
+                            letter = get_column_letter(col)
+                            ws.cell(row=sub["row"], column=col).value = f"=SUM({letter}{first}:{letter}{last})"
+                    sub_refs.append(sub["row"])
+                for col in [2] + list(range(4, 16)):
+                    letter = get_column_letter(col)
+                    formula = "=" + "+".join(f"{letter}{r}" for r in sub_refs) if sub_refs else 0
+                    ws.cell(row=h["row"], column=col).value = formula
+            elif h["direct_items"]:
+                first, last = h["direct_items"][0]["row"], h["direct_items"][-1]["row"]
+                for col in [2] + list(range(4, 16)):
+                    letter = get_column_letter(col)
+                    ws.cell(row=h["row"], column=col).value = f"=SUM({letter}{first}:{letter}{last})"
+            heading_cell_refs.append(h["row"])
+
+        if total_row is None:
+            total_row = ws.max_row + 1
+            ws.cell(row=total_row, column=1).value = "Total"
+        for col in [2] + list(range(4, 16)):
+            letter = get_column_letter(col)
+            formula = "=" + "+".join(f"{letter}{r}" for r in heading_cell_refs) if heading_cell_refs else 0
+            ws.cell(row=total_row, column=col).value = formula
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def render_actuals_upload_mode():
-    st.caption("Upload a transaction-level actuals export here — Forecasting mode will automatically use it instead of the budget file's own month columns.")
-
-    existing = st.session_state.get("actuals_dump_mapping")
-    if existing:
-        df_dump, date_col, dump_name_col, amount_col = existing
-        st.success(f"Actuals dump loaded — {len(df_dump):,} rows, matched on '{dump_name_col}' with amounts from '{amount_col}'.")
-        if st.button("Clear uploaded actuals dump"):
-            st.session_state.pop("actuals_dump_mapping", None)
-            st.rerun()
-        st.markdown('<div class="step-label">Replace it</div>', unsafe_allow_html=True)
-
-    dump_file = st.file_uploader("Actuals dump (.xlsx or .csv)", type=["xlsx", "csv"], key="actuals_dump_file")
-
-    if not dump_file:
-        if not existing:
-            st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount.")
-        return
-
-    try:
-        if dump_file.name.lower().endswith(".csv"):
-            df_dump = pd.read_csv(dump_file)
-        else:
-            df_dump = pd.read_excel(dump_file, engine="openpyxl")
-    except Exception as e:
-        st.error(f"Couldn't read this file: {e}")
-        return
-
-    if df_dump.empty:
-        st.warning("This file appears to be empty.")
-        return
-
-    st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
-    dump_columns = list(df_dump.columns)
-    guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
-    guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
-    guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
-
-    dc1, dc2, dc3 = st.columns(3)
-    date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
-    dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
-    amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
-
-    st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
-    st.caption("Matched against your budget file's line items by name in Forecasting mode — go there once you're happy with the mapping above.")
-
-
 def render_forecast_mode():
-    st.caption("This mode does pure arithmetic — no AI, no API calls, no cost.")
+    st.caption("Adds new contracts into your Hub71 budget template, pro-rated for the months remaining in the calendar year, and keeps every heading/subheading/grand-total roll-up in sync.")
 
-    dump_mapping = st.session_state.get("actuals_dump_mapping")
-    if dump_mapping:
-        st.info(f"Using actuals from your uploaded dump ({len(dump_mapping[0]):,} rows) — see the **Actuals Upload** tab to change or clear it.")
-    else:
-        st.caption("No actuals dump uploaded — using the budget file's own month columns. Switch to the **Actuals Upload** tab to use a transaction-level export instead.")
+    if st.session_state.results is None:
+        st.info("Run **Contract Audit** first — Forecasting needs the Counterparty, Effective Date, Term, and Contract Value from there.")
+        return
+    if not st.session_state.get("classification_results"):
+        st.info("Run **Contract Classification** first — Forecasting uses the category (HC/CO/CS/GS/MM) to pick the right sheet for each contract.")
+        return
 
     st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
-    budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="budget_file")
-
+    budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="forecast_budget_file")
     if not budget_file:
-        st.info("Upload a workbook with one row per budget line, an annual budget column, and monthly columns (Jan\u2013Dec).")
+        st.info("Upload the Hub71 budget workbook (sheets named CO / GS / CS / MM, with purple heading rows and grey subheading rows).")
         return
 
     try:
-        xls = pd.ExcelFile(budget_file, engine="openpyxl")
+        wb = openpyxl.load_workbook(budget_file, data_only=False)
     except Exception as e:
         st.error(f"Couldn't read this workbook: {e}")
         return
 
-    sheet_name = st.selectbox("Sheet", xls.sheet_names) if len(xls.sheet_names) > 1 else xls.sheet_names[0]
-    df = pd.read_excel(xls, sheet_name=sheet_name)
+    year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1)
 
-    if df.empty:
-        st.warning("This sheet appears to be empty.")
+    # Build the sheet structure once so we can match categories to real sheets and show existing headings.
+    sheet_data = {}
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        nodes = build_sheet_structure(ws)
+        headings, line_item_index, total_row = get_hierarchy(nodes)
+        sheet_data[sheet_name] = {"headings": headings, "line_item_index": line_item_index, "total_row": total_row}
+
+    audit_df = apply_reviewer_overrides(st.session_state.results)
+    pdf_bytes_map = st.session_state.get("pdf_bytes", {})
+
+    st.markdown('<div class="step-label">2 · Review planned changes</div>', unsafe_allow_html=True)
+
+    plan = []  # list of dicts, one per contract needing a decision
+    for r in st.session_state.classification_results:
+        file_name = r.get("file")
+        if "error" in r:
+            continue
+        suggested_category = r.get("category", "")
+        category = st.session_state.get(f"reviewer_class_{file_name}", suggested_category)
+        if category not in sheet_data or sheet_data.get(category) is None:
+            continue  # e.g. HC has no matching sheet in this workbook
+        if category not in wb.sheetnames:
+            plan.append({"file": file_name, "category": category, "status": "no_sheet"})
+            continue
+
+        file_rows = audit_df[audit_df.get("File") == file_name] if "File" in audit_df.columns else pd.DataFrame()
+        if file_rows.empty:
+            plan.append({"file": file_name, "category": category, "status": "no_audit_data"})
+            continue
+        row = file_rows.iloc[0]
+        counterparty = str(row.get("Counterparty", "")).strip()
+        if not counterparty or counterparty.lower() == "not found":
+            plan.append({"file": file_name, "category": category, "status": "no_counterparty"})
+            continue
+
+        sheet_info = sheet_data[category]
+        existing_match = sheet_info["line_item_index"].get(normalize_name(counterparty))
+        if existing_match:
+            plan.append({
+                "file": file_name, "category": category, "counterparty": counterparty,
+                "status": "already_present", "existing_heading": existing_match[0], "existing_subheading": existing_match[1],
+            })
+            continue
+
+        eff_date = parse_date_flexible(row.get("Effective Date"))
+        duration = parse_duration_months(row.get("Term / Expiry"), eff_date)
+        value = parse_amount(row.get("Contract Value"))
+        total, monthly_rate, active_months = compute_prorated_budget(value, eff_date, duration, year)
+
+        # Ask the model to suggest where this fits among the sheet's real headings.
+        suggested_heading, suggested_subheading = None, ""
+        headings = sheet_info["headings"]
+        if headings and OPENAI_API_KEY and file_name in pdf_bytes_map:
+            try:
+                text = extract_pdf_text(io.BytesIO(pdf_bytes_map[file_name]))[:MAX_CHARS]
+                prompt = build_placement_prompt(text, headings)
+                raw = call_openai(prompt, OPENAI_API_KEY, OPENAI_MODEL)
+                parsed = parse_json_response(raw)
+                if "heading" in parsed:
+                    suggested_heading = parsed.get("heading")
+                    suggested_subheading = parsed.get("subheading", "") or ""
+            except Exception:
+                pass
+        if suggested_heading not in [h["name"] for h in headings]:
+            suggested_heading = headings[0]["name"] if headings else None
+
+        plan.append({
+            "file": file_name, "category": category, "counterparty": counterparty,
+            "status": "new", "sheet": category,
+            "effective_date": eff_date, "duration_months": duration, "contract_value": value,
+            "prorated_total": total, "monthly_rate": monthly_rate, "active_months": active_months,
+            "suggested_heading": suggested_heading, "suggested_subheading": suggested_subheading,
+        })
+
+    if not plan:
+        st.info("Nothing to plan yet — classify at least one contract into HC/CO/CS/GS/MM first.")
         return
 
-    st.markdown('<div class="step-label">2 · Confirm columns</div>', unsafe_allow_html=True)
-    columns = list(df.columns)
-    guessed_name = guess_column(columns, ["name", "item", "channel", "department", "category", "line"])
-    guessed_budget = guess_column(columns, ["budget", "annual"])
-    guessed_months = guess_month_columns(columns)
+    plan_by_sheet = {}
+    for item in plan:
+        label = f"{item.get('counterparty', item['file'])} — {item['category']}"
+        with st.expander(label):
+            if item["status"] == "no_sheet":
+                st.warning(f"No sheet named '{item['category']}' in this workbook — can't place this contract.")
+                continue
+            if item["status"] == "no_audit_data":
+                st.warning("No matching Contract Audit results found for this file.")
+                continue
+            if item["status"] == "no_counterparty":
+                st.warning("Counterparty wasn't found in Contract Audit — fix that in Audit mode's 'Edit values' first.")
+                continue
+            if item["status"] == "already_present":
+                loc = item["existing_heading"] + (f" → {item['existing_subheading']}" if item["existing_subheading"] else "")
+                st.success(f"Already in the budget under **{loc}** — no new line will be added.")
+                continue
 
-    c1, c2 = st.columns(2)
-    name_col = c1.selectbox("Line item name column", columns, index=columns.index(guessed_name) if guessed_name in columns else 0)
-    budget_col = c2.selectbox("Annual budget column", columns, index=columns.index(guessed_budget) if guessed_budget in columns else 0)
+            # status == "new"
+            issues = []
+            if item["effective_date"] is None:
+                issues.append("Effective Date")
+            if item["duration_months"] is None:
+                issues.append("Term / Expiry")
+            if item["contract_value"] is None:
+                issues.append("Contract Value")
+            if issues:
+                st.warning(f"Couldn't parse: {', '.join(issues)} — enter the prorated amount manually below.")
 
-    st.caption("Month columns detected (Jan \u2192 Dec) \u2014 adjust any that are wrong:")
-    month_cols = []
-    cols_ui = st.columns(6)
-    for i, month in enumerate(MONTH_NAMES):
-        options = ["(none)"] + columns
-        default = guessed_months[i] if guessed_months[i] in columns else "(none)"
-        with cols_ui[i % 6]:
-            picked = st.selectbox(month, options, index=options.index(default), key=f"month_col_{i}", label_visibility="visible")
-        month_cols.append(None if picked == "(none)" else picked)
+            headings = sheet_data[item["category"]]["headings"]
+            heading_names = [h["name"] for h in headings]
+            default_h_idx = heading_names.index(item["suggested_heading"]) if item["suggested_heading"] in heading_names else 0
+            chosen_heading_name = st.selectbox("Heading", heading_names, index=default_h_idx, key=f"plan_heading_{item['file']}")
+            chosen_heading = next(h for h in headings if h["name"] == chosen_heading_name)
 
-    st.markdown('<div class="step-label">3 · Forecast settings</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns(2)
-    year = c1.number_input("Forecast year (calendar year, starts January)", min_value=2020, max_value=2100, value=2026, step=1)
-    through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=7)
-    through_idx = MONTH_NAMES.index(through_month) + 1
+            chosen_subheading_name = ""
+            if chosen_heading["subheadings"]:
+                sub_names = [s["name"] for s in chosen_heading["subheadings"]]
+                default_s_idx = sub_names.index(item["suggested_subheading"]) if item["suggested_subheading"] in sub_names else 0
+                chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
 
-    if st.button("Generate forecast", type="primary"):
-        if not budget_col or budget_col not in df.columns:
-            st.error("Please select a valid annual budget column.")
-            return
+            default_total = round(item["prorated_total"], 2) if item["prorated_total"] is not None else 0.0
+            reviewer_total = st.number_input(
+                f"Budgeted amount for {year} (pro-rated)", value=default_total, key=f"plan_total_{item['file']}"
+            )
+            months_left = len(item["active_months"]) if item["active_months"] else 0
+            monthly_rate = (reviewer_total / months_left) if months_left else 0.0
+            st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate:,.2f}/month")
 
-        actuals_lookup = None
-        if dump_mapping:
-            df_dump, date_col, dump_name_col, amount_col = dump_mapping
-            actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
-        elif all(c is None for c in month_cols):
-            st.error("At least one month column needs to be mapped.")
-            return
+            plan_by_sheet.setdefault(item["category"], []).append({
+                "counterparty": item["counterparty"],
+                "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
+                "prorated_total": reviewer_total,
+                "monthly_rate": monthly_rate,
+                "active_months": item["active_months"] or list(range(1, 13)),
+            })
 
-        forecast_rows = compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx, actuals_lookup)
-        workbook_bytes = build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year, actuals_lookup)
+    st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
+    if st.button("Apply to workbook", type="primary", disabled=not plan_by_sheet):
+        workbook_bytes = write_forecast_workbook(wb, plan_by_sheet)
+        st.session_state.forecast_workbook_bytes = workbook_bytes
+        st.session_state.forecast_sheets_touched = list(plan_by_sheet.keys())
 
-
-        st.markdown('<div class="step-label">Results</div>', unsafe_allow_html=True)
-        preview = pd.DataFrame([{
-            "Line Item": fr["name"],
-            "Annual Budget": fr["annual_budget"],
-            f"Actual (Jan\u2013{through_month})": fr["actual_to_date"],
-            "Remaining Budget": fr["remaining"],
-            f"Forecast / month ({12 - through_idx} left)": round(fr["monthly_forecast"], 2),
-        } for fr in forecast_rows])
-        st.markdown(preview.to_html(index=False, escape=False, na_rep=""), unsafe_allow_html=True)
+    if st.session_state.get("forecast_workbook_bytes"):
+        st.markdown('<div class="step-label">Updated sheets</div>', unsafe_allow_html=True)
+        result_wb = openpyxl.load_workbook(io.BytesIO(st.session_state.forecast_workbook_bytes), data_only=False)
+        for sheet_name in st.session_state.forecast_sheets_touched:
+            ws = result_wb[sheet_name]
+            st.caption(f"**{sheet_name}**")
+            rows_out = []
+            for row in range(3, ws.max_row + 1):
+                name = ws.cell(row=row, column=1).value
+                if name is None:
+                    continue
+                budget = ws.cell(row=row, column=2).value
+                month_vals = [ws.cell(row=row, column=4 + m).value for m in range(12)]
+                rows_out.append([name, budget] + month_vals)
+            preview_df = pd.DataFrame(rows_out, columns=["Line Item", "Budget"] + MONTH_NAMES)
+            st.markdown(preview_df.to_html(index=False, escape=False, na_rep=""), unsafe_allow_html=True)
 
         st.download_button(
             "Download updated workbook",
-            data=workbook_bytes,
-            file_name=f"budget_forecast_{year}.xlsx",
+            data=st.session_state.forecast_workbook_bytes,
+            file_name=f"budget_updated_{year}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+        st.caption("Heading, subheading, and grand-total cells now contain live Excel SUM formulas, so the workbook stays fully editable.")
 
-# ---------------------------------------------------------------------------
-# Mode toggle
-# ---------------------------------------------------------------------------
 mode = st.radio(
     "Mode",
     ["Contract Audit", "Contract Classification", "Actuals Upload", "Forecasting"],
