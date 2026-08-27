@@ -1252,6 +1252,12 @@ def render_forecast_mode():
         st.info("Complete and **Confirm** Contract Classification first — Forecasting reads the confirmed snapshot, not live edits.")
         return
 
+    confirmed_names = [r.get("file", "?") for r in st.session_state.confirmed_classification]
+    with st.expander(f"Currently confirmed: {len(confirmed_names)} contract(s) — check this is your real, current set", expanded=False):
+        for n in confirmed_names:
+            st.caption(f"• {n}")
+        st.caption("If this shows old test files or contracts you no longer want, go back to Step 1, re-run extraction (it clears the old snapshot), then re-confirm Steps 1 and 2 with the correct files before returning here.")
+
     st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
     budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="forecast_budget_file")
     if not budget_file:
@@ -1263,6 +1269,16 @@ def render_forecast_mode():
     except Exception as e:
         st.error(f"Couldn't read this workbook: {e}")
         return
+
+    # A different uploaded file (or a re-upload of the same one) invalidates any
+    # previously generated output — otherwise a stale download could silently
+    # persist even after you've moved on to a different workbook or contract set.
+    import hashlib
+    file_signature = hashlib.md5(budget_file.getvalue()).hexdigest()
+    if st.session_state.get("forecast_budget_signature") != file_signature:
+        st.session_state.pop("forecast_workbook_bytes", None)
+        st.session_state.pop("forecast_sheets_touched", None)
+        st.session_state["forecast_budget_signature"] = file_signature
 
     year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1)
 
