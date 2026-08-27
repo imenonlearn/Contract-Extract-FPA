@@ -1213,7 +1213,11 @@ def render_forecast_mode():
         # Ask the model to suggest where this fits among the sheet's real headings.
         suggested_heading, suggested_subheading = None, ""
         headings = sheet_info["headings"]
-        if headings and OPENAI_API_KEY and file_name in pdf_bytes_map:
+        cache_key = f"{file_name}::{category}"
+        placement_cache = st.session_state.setdefault("placement_cache", {})
+        if cache_key in placement_cache:
+            suggested_heading, suggested_subheading = placement_cache[cache_key]
+        elif headings and OPENAI_API_KEY and file_name in pdf_bytes_map:
             try:
                 text = extract_pdf_text(io.BytesIO(pdf_bytes_map[file_name]))[:MAX_CHARS]
                 prompt = build_placement_prompt(text, headings)
@@ -1222,6 +1226,7 @@ def render_forecast_mode():
                 if "heading" in parsed:
                     suggested_heading = parsed.get("heading")
                     suggested_subheading = parsed.get("subheading", "") or ""
+                placement_cache[cache_key] = (suggested_heading, suggested_subheading)
             except Exception:
                 pass
         if suggested_heading not in [h["name"] for h in headings]:
@@ -1293,8 +1298,13 @@ def render_forecast_mode():
                     chosen_subheading_name = st.selectbox("Subheading", sub_names, index=default_s_idx, key=f"plan_sub_{item['file']}")
 
                 default_total = round(item["prorated_total"], 2) if item["prorated_total"] is not None else 0.0
+                # Key includes the freshly computed default so a correction to
+                # Effective Date / Term / Contract Value in Audit mode — which changes
+                # this default — shows up here automatically instead of being stuck
+                # on whatever was typed the first time this box was ever shown.
+                amount_key = f"plan_total_{item['file']}_{default_total}"
                 reviewer_total = st.number_input(
-                    f"Budgeted amount for {year} (pro-rated)", value=default_total, key=f"plan_total_{item['file']}"
+                    f"Budgeted amount for {year} (pro-rated)", value=default_total, key=amount_key
                 )
                 months_left = len(item["active_months"]) if item["active_months"] else 0
                 monthly_rate = (reviewer_total / months_left) if months_left else 0.0
