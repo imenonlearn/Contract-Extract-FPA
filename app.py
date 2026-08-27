@@ -1089,6 +1089,53 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
     return buf.getvalue()
 
 
+def render_actuals_upload_mode():
+    st.caption("Upload a transaction-level actuals export here — Forecasting mode will automatically use it instead of the budget file's own month columns.")
+
+    existing = st.session_state.get("actuals_dump_mapping")
+    if existing:
+        df_dump, date_col, dump_name_col, amount_col = existing
+        st.success(f"Actuals dump loaded — {len(df_dump):,} rows, matched on '{dump_name_col}' with amounts from '{amount_col}'.")
+        if st.button("Clear uploaded actuals dump"):
+            st.session_state.pop("actuals_dump_mapping", None)
+            st.rerun()
+        st.markdown('<div class="step-label">Replace it</div>', unsafe_allow_html=True)
+
+    dump_file = st.file_uploader("Actuals dump (.xlsx or .csv)", type=["xlsx", "csv"], key="actuals_dump_file")
+
+    if not dump_file:
+        if not existing:
+            st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount.")
+        return
+
+    try:
+        if dump_file.name.lower().endswith(".csv"):
+            df_dump = pd.read_csv(dump_file)
+        else:
+            df_dump = pd.read_excel(dump_file, engine="openpyxl")
+    except Exception as e:
+        st.error(f"Couldn't read this file: {e}")
+        return
+
+    if df_dump.empty:
+        st.warning("This file appears to be empty.")
+        return
+
+    st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
+    dump_columns = list(df_dump.columns)
+    guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
+    guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
+    guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
+
+    dc1, dc2, dc3 = st.columns(3)
+    date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
+    dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
+    amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
+
+    st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
+    st.caption("Matched against your budget file's line items by name in Forecasting mode — go there once you're happy with the mapping above.")
+
+
 def render_forecast_mode():
     st.caption("Adds new contracts into your Hub71 budget template, pro-rated for the months remaining in the calendar year, and keeps every heading/subheading/grand-total roll-up in sync.")
 
