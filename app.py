@@ -979,12 +979,31 @@ def parse_duration_months(term_text, effective_date=None):
     return None
 
 
-def parse_amount(value_text):
+def parse_amount(value_text, duration_months=None):
+    """Parses a contract value figure. If the text indicates a recurring rate
+    (e.g. 'AED 42,000 per month') rather than a lump sum, converts it to the
+    TOTAL contract value using duration_months — otherwise every downstream
+    prorate calculation would treat the monthly figure as if it were the
+    entire contract, badly understating the real total."""
     if not value_text or str(value_text).strip().lower() == "not found":
         return None
     text = str(value_text).replace(",", "")
     m = re.search(r"(\d+\.?\d*)", text)
-    return float(m.group(1)) if m else None
+    if not m:
+        return None
+    amount = float(m.group(1))
+
+    lower = text.lower()
+    if duration_months:
+        if re.search(r"per\s*month|/\s*month|monthly", lower):
+            return amount * duration_months
+        if re.search(r"per\s*annum|per\s*year|/\s*year|annually", lower):
+            return amount * (duration_months / 12.0)
+        if re.search(r"per\s*quarter|quarterly", lower):
+            return amount * (duration_months / 3.0)
+        if re.search(r"per\s*week|weekly", lower):
+            return amount * (duration_months * 4.345)
+    return amount
 
 
 def compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year):
@@ -1344,7 +1363,7 @@ def render_forecast_mode():
 
         eff_date = parse_date_flexible(row.get("Effective Date"))
         duration = parse_duration_months(row.get("Term / Expiry"), eff_date)
-        value = parse_amount(row.get("Contract Value"))
+        value = parse_amount(row.get("Contract Value"), duration)
         raw_debug = {
             "Effective Date (raw)": row.get("Effective Date"),
             "Term / Expiry (raw)": row.get("Term / Expiry"),
