@@ -826,9 +826,29 @@ def guess_month_columns(columns):
     return result
 
 
-def compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx):
+def normalize_name(x) -> str:
+    return str(x).strip().lower()
+
+
+def build_monthly_actuals_lookup(df_dump, date_col, name_col, amount_col, year):
+    """Aggregates a transaction-level actuals dump into {(normalized_name, month_num): amount}."""
+    df = df_dump.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[df[date_col].dt.year == year]
+    df["_name_norm"] = df[name_col].apply(normalize_name)
+    df["_month"] = df[date_col].dt.month
+    try:
+        df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
+    except Exception:
+        pass
+    grouped = df.groupby(["_name_norm", "_month"])[amount_col].sum()
+    return grouped.to_dict()
+
+
+def compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx, actuals_lookup=None):
     """through_idx: number of months already actual (e.g. 8 = Jan-Aug are actuals).
-    Returns a list of dicts with computed figures per row."""
+    If actuals_lookup is provided (from an uploaded actuals dump), it's used instead
+    of the budget file's own month columns. Returns a list of dicts per row."""
     rows = []
     for _, row in df.iterrows():
         name = row[name_col]
@@ -839,14 +859,18 @@ def compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx):
 
         actual_to_date = 0.0
         for i in range(through_idx):
-            col = month_cols[i]
-            if col is None:
-                continue
-            try:
-                val = float(row[col]) if pd.notna(row[col]) else 0.0
-            except (TypeError, ValueError):
-                val = 0.0
-            actual_to_date += val
+            month_num = i + 1
+            if actuals_lookup is not None:
+                actual_to_date += actuals_lookup.get((normalize_name(name), month_num), 0.0)
+            else:
+                col = month_cols[i]
+                if col is None:
+                    continue
+                try:
+                    val = float(row[col]) if pd.notna(row[col]) else 0.0
+                except (TypeError, ValueError):
+                    val = 0.0
+                actual_to_date += val
 
         remaining = annual_budget - actual_to_date
         months_left = 12 - through_idx
@@ -863,9 +887,10 @@ def compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx):
     return rows
 
 
-def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year) -> bytes:
+def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year, actuals_lookup=None) -> bytes:
     """Writes an updated workbook: actual months unchanged, remaining months filled
-    with the evenly-spread forecast, with forecast cells highlighted."""
+    with the evenly-spread forecast, with forecast cells highlighted. If actuals_lookup
+    is provided, elapsed-month values come from the dump instead of the budget file."""
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill, Font
 
@@ -891,11 +916,14 @@ def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, f
         month_values = []
         for m in range(12):
             if m < through_idx:
-                col = month_cols[m]
-                try:
-                    val = float(df.iloc[i][col]) if col is not None and pd.notna(df.iloc[i][col]) else 0.0
-                except (TypeError, ValueError):
-                    val = 0.0
+                if actuals_lookup is not None:
+                    val = actuals_lookup.get((normalize_name(fr["name"]), m + 1), 0.0)
+                else:
+                    col = month_cols[m]
+                    try:
+                        val = float(df.iloc[i][col]) if col is not None and pd.notna(df.iloc[i][col]) else 0.0
+                    except (TypeError, ValueError):
+                        val = 0.0
             else:
                 val = round(fr["monthly_forecast"], 2)
             month_values.append(val)
@@ -925,9 +953,15 @@ def build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, f
 
 
 def render_forecast_mode():
-    st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
     st.caption("This mode does pure arithmetic — no AI, no API calls, no cost.")
-    budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed")
+
+    use_dump = st.toggle(
+        "Upload a separate actuals dump (transaction-level export) instead of using the budget file's own month columns",
+        value=False,
+    )
+
+    st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
+    budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="budget_file")
 
     if not budget_file:
         st.info("Upload a workbook with one row per budget line, an annual budget column, and monthly columns (Jan\u2013Dec).")
@@ -966,7 +1000,41 @@ def render_forecast_mode():
             picked = st.selectbox(month, options, index=options.index(default), key=f"month_col_{i}", label_visibility="visible")
         month_cols.append(None if picked == "(none)" else picked)
 
-    st.markdown('<div class="step-label">3 · Forecast settings</div>', unsafe_allow_html=True)
+    actuals_lookup = None
+    if use_dump:
+        st.markdown('<div class="step-label">3 · Upload actuals dump</div>', unsafe_allow_html=True)
+        st.caption("A transaction-level export — one row per transaction, with a date, a line-item name, and an amount. Matched to your budget lines by name.")
+        dump_file = st.file_uploader("Actuals dump (.xlsx or .csv)", type=["xlsx", "csv"], key="actuals_dump_file")
+
+        if dump_file:
+            try:
+                if dump_file.name.lower().endswith(".csv"):
+                    df_dump = pd.read_csv(dump_file)
+                else:
+                    df_dump = pd.read_excel(dump_file, engine="openpyxl")
+            except Exception as e:
+                st.error(f"Couldn't read this file: {e}")
+                df_dump = None
+
+            if df_dump is not None and not df_dump.empty:
+                dump_columns = list(df_dump.columns)
+                guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
+                guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
+                guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
+
+                dc1, dc2, dc3 = st.columns(3)
+                date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
+                dump_name_col = dc2.selectbox("Line item column", dump_columns, index=dump_columns.index(guessed_dump_name) if guessed_dump_name in dump_columns else 0)
+                amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
+
+                st.session_state["_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col)
+            else:
+                st.session_state.pop("_dump_mapping", None)
+        else:
+            st.info("Upload the actuals dump to continue, or turn off the toggle above to use the budget file's own month columns instead.")
+            st.session_state.pop("_dump_mapping", None)
+
+    st.markdown('<div class="step-label">4 · Forecast settings</div>' if use_dump else '<div class="step-label">3 · Forecast settings</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     year = c1.number_input("Forecast year (calendar year, starts January)", min_value=2020, max_value=2100, value=2026, step=1)
     through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=7)
@@ -976,12 +1044,20 @@ def render_forecast_mode():
         if not budget_col or budget_col not in df.columns:
             st.error("Please select a valid annual budget column.")
             return
-        if all(c is None for c in month_cols):
-            st.error("At least one month column needs to be mapped.")
-            return
+        if use_dump:
+            if "_dump_mapping" not in st.session_state:
+                st.error("Please upload and map an actuals dump first, or turn off the toggle above.")
+                return
+            df_dump, date_col, dump_name_col, amount_col = st.session_state["_dump_mapping"]
+            actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
+        else:
+            if all(c is None for c in month_cols):
+                st.error("At least one month column needs to be mapped.")
+                return
 
-        forecast_rows = compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx)
-        workbook_bytes = build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year)
+        forecast_rows = compute_forecast_rows(df, name_col, budget_col, month_cols, through_idx, actuals_lookup)
+        workbook_bytes = build_forecast_workbook(df, name_col, budget_col, month_cols, through_idx, forecast_rows, year, actuals_lookup)
+
 
         st.markdown('<div class="step-label">Results</div>', unsafe_allow_html=True)
         preview = pd.DataFrame([{
