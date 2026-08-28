@@ -268,7 +268,6 @@ def call_openai(prompt: str, api_key: str, model: str) -> str:
         json={
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
         },
         timeout=180,
     )
@@ -453,7 +452,6 @@ def render_audit_mode():
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
             },
             timeout=180,
         )
