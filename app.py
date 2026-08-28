@@ -18,6 +18,7 @@ API key:
 import io
 import json
 import os
+import pickle
 import re
 
 import openpyxl
@@ -29,8 +30,63 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENAI_MODEL = "gpt-4o-mini"
+OPENAI_MODEL = "gpt-5.6-terra"
 MAX_CHARS = 80000  # contract text sent to the model per document (~20k tokens — comfortably covers most contracts)
+PERSIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".app_state.pkl")
+
+# Keys that hold real data worth persisting across a page refresh. Dynamic
+# per-row widget keys (overrides, reviewer picks, plan choices) are also
+# persisted via the prefix list below — everything else (raw file_uploader
+# widget state, nav buttons) is left alone since it can't/shouldn't be
+# pre-seeded before its widget is created.
+PERSIST_KEYS = [
+    "fields", "results", "source_items", "pdf_bytes", "truncation_warnings",
+    "confirmed_audit_df", "classification_results", "confirmed_classification",
+    "confirmed_account_names", "actuals_dump_mapping", "forecast_workbook_bytes",
+    "forecast_sheets_touched", "forecast_budget_signature", "wizard_step",
+    "max_unlocked_step", "placement_cache", "selected_source",
+]
+PERSIST_PREFIXES = (
+    "override_", "reviewer_class_", "plan_heading_", "plan_sub_",
+    "plan_account_", "plan_total_", "fix_effdate_", "fix_term_", "fix_value_",
+    "month_col_",
+)
+
+
+def save_persisted_state():
+    """Best-effort — persistence failing should never break the app."""
+    try:
+        data = {k: st.session_state[k] for k in PERSIST_KEYS if k in st.session_state}
+        for k in st.session_state.keys():
+            if k.startswith(PERSIST_PREFIXES):
+                data[k] = st.session_state[k]
+        with open(PERSIST_FILE, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_persisted_state():
+    if not os.path.exists(PERSIST_FILE):
+        return
+    try:
+        with open(PERSIST_FILE, "rb") as f:
+            data = pickle.load(f)
+        for k, v in data.items():
+            st.session_state[k] = v
+    except Exception:
+        pass
+
+
+def clear_persisted_state():
+    try:
+        if os.path.exists(PERSIST_FILE):
+            os.remove(PERSIST_FILE)
+    except Exception:
+        pass
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
 
 st.set_page_config(page_title="Contract Terms Extract", page_icon="📄", layout="wide")
 
@@ -105,6 +161,10 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+if "_state_loaded" not in st.session_state:
+    load_persisted_state()
+    st.session_state["_state_loaded"] = True
+
 if "fields" not in st.session_state:
     st.session_state.fields = [
         {"name": "Counterparty", "hint": "The other party to the contract (not our company)"},
@@ -157,9 +217,22 @@ with st.sidebar:
         st.warning("Not connected")
     st.divider()
     st.caption(
-        "Prototype — no data is stored between sessions. "
+        "Your progress is saved automatically and survives page refreshes. "
         "Contract text is sent to OpenAI's API for extraction."
     )
+    st.divider()
+    if st.button("🗑️ Clear everything", use_container_width=True):
+        st.session_state["_confirm_clear"] = True
+
+    if st.session_state.get("_confirm_clear"):
+        st.warning("This permanently deletes all extracted, classified, and forecasted data. This can't be undone.")
+        cc1, cc2 = st.columns(2)
+        if cc1.button("Yes, clear it all", type="primary", use_container_width=True):
+            clear_persisted_state()
+            st.rerun()
+        if cc2.button("Cancel", use_container_width=True):
+            st.session_state["_confirm_clear"] = False
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1743,3 +1816,5 @@ elif st.session_state.wizard_step == 4:
     render_forecast_mode()
 else:
     render_variance_mode()
+
+save_persisted_state()
