@@ -1372,21 +1372,24 @@ def render_forecast_mode():
         st.error(f"Couldn't read this workbook: {e}")
         return
 
-    # A different uploaded file (or a re-upload of the same one) invalidates any
-    # previously generated output — otherwise a stale download could silently
-    # persist even after you've moved on to a different workbook or contract set.
-    import hashlib
-    file_signature = hashlib.md5(budget_file.getvalue()).hexdigest()
-    if st.session_state.get("forecast_budget_signature") != file_signature:
-        st.session_state.pop("forecast_workbook_bytes", None)
-        st.session_state.pop("forecast_sheets_touched", None)
-        st.session_state["forecast_budget_signature"] = file_signature
-
+    # A different uploaded file, actuals dump, calendar year, or "through
+    # month" all invalidate any previously generated output — otherwise a
+    # stale download could silently persist even after everything upstream
+    # has changed. The signature is finalized once through_month is known.
     year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1)
 
+    import hashlib
     dump_mapping = st.session_state.get("actuals_dump_mapping")
+    dump_fingerprint = ""
+    if dump_mapping:
+        try:
+            dump_fingerprint = hashlib.md5(pd.util.hash_pandas_object(dump_mapping[0]).values.tobytes()).hexdigest()
+        except Exception:
+            dump_fingerprint = str(len(dump_mapping[0]))
+
     actuals_lookup = None
     through_month_idx = 12
+    through_month = None
     if dump_mapping:
         df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
         match_col = account_col or dump_name_col
@@ -1414,6 +1417,12 @@ def render_forecast_mode():
                 st.warning(f"No actuals matched for year {year} — check the Date column actually contains {year} dates, and that '{match_col}' holds counterparty names.")
     else:
         st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
+
+    file_signature = hashlib.md5(budget_file.getvalue()).hexdigest() + f"::{year}::{dump_fingerprint}::{through_month_idx}"
+    if st.session_state.get("forecast_budget_signature") != file_signature:
+        st.session_state.pop("forecast_workbook_bytes", None)
+        st.session_state.pop("forecast_sheets_touched", None)
+        st.session_state["forecast_budget_signature"] = file_signature
 
     # Build the sheet structure once so we can match categories to real sheets and show existing headings.
     sheet_data = {}
