@@ -1555,6 +1555,7 @@ def render_forecast_mode():
         workbook_bytes = write_forecast_workbook(wb, plan_by_sheet)
         st.session_state.forecast_workbook_bytes = workbook_bytes
         st.session_state.forecast_sheets_touched = list(plan_by_sheet.keys())
+        st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 5)
 
     if st.session_state.get("forecast_workbook_bytes"):
         st.markdown('<div class="step-label">Updated sheets</div>', unsafe_allow_html=True)
@@ -1581,11 +1582,141 @@ def render_forecast_mode():
         )
         st.caption("Heading, subheading, and grand-total cells now contain live Excel SUM formulas, so the workbook stays fully editable.")
 
+def render_variance_mode():
+    st.caption("Compares actual spend against your finalized budget by cohort and by line item — pure arithmetic, no AI, no API calls.")
+
+    if not st.session_state.get("forecast_workbook_bytes"):
+        st.info("Complete **Step 4 (Forecasting)** and click 'Apply to workbook' first — variance tracking compares actuals against that finalized budget.")
+        return
+
+    dump_mapping = st.session_state.get("actuals_dump_mapping")
+    if not dump_mapping:
+        st.info("Upload an actuals dump in **Step 3** first — variance tracking needs real spend data to compare against the budget.")
+        return
+
+    df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
+    match_col = account_col or dump_name_col
+
+    c1, c2 = st.columns(2)
+    year = c1.number_input("Calendar year", min_value=2020, max_value=2100, value=2026, step=1, key="variance_year")
+    through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=11, key="variance_through")
+    through_idx = MONTH_NAMES.index(through_month) + 1
+
+    wb = openpyxl.load_workbook(io.BytesIO(st.session_state.forecast_workbook_bytes), data_only=False)
+
+    # Read budgeted figures straight from the leaf line-item cells (not the
+    # heading/subheading/total formulas) so nothing depends on Excel having
+    # actually recalculated the workbook yet.
+    line_item_to_sheet = {}
+    sheet_budget = {}
+    line_item_budget = {}  # (sheet, normalized_name) -> {"annual": x, "to_date": y, "display_name": ...}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        nodes = build_sheet_structure(ws)
+        annual_total, to_date_total = 0.0, 0.0
+        for node in nodes:
+            if node["type"] != "line_item":
+                continue
+            row = node["row"]
+            name_norm = normalize_name(node["name"])
+            line_item_to_sheet[name_norm] = sheet_name
+            annual = 0.0
+            to_date = 0.0
+            for m in range(1, 13):
+                val = ws.cell(row=row, column=3 + m).value
+                val = val if isinstance(val, (int, float)) else 0.0
+                annual += val
+                if m <= through_idx:
+                    to_date += val
+            line_item_budget[(sheet_name, name_norm)] = {
+                "annual": annual, "to_date": to_date, "display_name": node["name"],
+            }
+            annual_total += annual
+            to_date_total += to_date
+        sheet_budget[sheet_name] = {"annual": annual_total, "to_date": to_date_total}
+
+    # Aggregate actuals through the chosen month, matched by name.
+    df = df_dump.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df[(df[date_col].dt.year == year) & (df[date_col].dt.month <= through_idx)]
+    df["_name_norm"] = df[match_col].apply(normalize_name)
+    try:
+        df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
+    except Exception:
+        pass
+    actual_by_name = df.groupby("_name_norm")[amount_col].sum().to_dict()
+
+    sheet_actual = {}
+    line_item_actual = {}
+    for name_norm, amt in actual_by_name.items():
+        sheet_name = line_item_to_sheet.get(name_norm)
+        if sheet_name is None:
+            continue
+        sheet_actual[sheet_name] = sheet_actual.get(sheet_name, 0.0) + amt
+        line_item_actual[(sheet_name, name_norm)] = amt
+
+    def status_for(actual, budget):
+        if not budget:
+            return ("No budget", "gray") if not actual else ("Spend with no budget", "red")
+        pct = actual / budget * 100
+        if pct > 115:
+            return (f"Over pace ({pct:.0f}% of prorated budget)", "red")
+        if pct < 80:
+            return (f"Under pace ({pct:.0f}% of prorated budget)", "orange")
+        return (f"On track ({pct:.0f}% of prorated budget)", "green")
+
+    st.markdown('<div class="step-label">Cohort summary</div>', unsafe_allow_html=True)
+    for sheet_name in wb.sheetnames:
+        budget_to_date = sheet_budget.get(sheet_name, {}).get("to_date", 0.0)
+        annual_budget = sheet_budget.get(sheet_name, {}).get("annual", 0.0)
+        actual = sheet_actual.get(sheet_name, 0.0)
+        label, color = status_for(actual, budget_to_date)
+        full_name = CLASSIFICATION_CATEGORIES.get(sheet_name, sheet_name)
+
+        with st.container(border=True):
+            cols = st.columns([2, 1.3, 1.3, 1.3, 2])
+            cols[0].markdown(f"**{sheet_name} — {full_name}**")
+            cols[1].metric("Annual budget", f"{annual_budget:,.0f}")
+            cols[2].metric(f"Budget to {through_month}", f"{budget_to_date:,.0f}")
+            cols[3].metric(f"Actual to {through_month}", f"{actual:,.0f}")
+            variance = actual - budget_to_date
+            sign = "+" if variance > 0 else ""
+            cols[4].markdown(f":{color}[**{label}**]")
+            cols[4].caption(f"Variance: {sign}{variance:,.0f}")
+
+    st.markdown('<div class="step-label">Line items to review</div>', unsafe_allow_html=True)
+    st.caption("Flagged when a line's actual spend to date is well outside its own prorated budget — possible candidates for reallocating budget between lines.")
+
+    flagged_any = False
+    for (sheet_name, name_norm), info in line_item_budget.items():
+        actual = line_item_actual.get((sheet_name, name_norm), 0.0)
+        budget_to_date = info["to_date"]
+        if budget_to_date == 0 and actual == 0:
+            continue
+        if budget_to_date == 0:
+            pct = None
+        else:
+            pct = actual / budget_to_date * 100
+        if pct is not None and 80 <= pct <= 115:
+            continue  # within normal range, don't clutter the list
+        flagged_any = True
+        full_name = CLASSIFICATION_CATEGORIES.get(sheet_name, sheet_name)
+        if pct is None:
+            msg = f"**{info['display_name']}** ({sheet_name}) — {actual:,.0f} spent with no budget allocated to {through_month}."
+        elif pct > 115:
+            msg = f"**{info['display_name']}** ({sheet_name}) — {pct:.0f}% of its prorated budget used ({actual:,.0f} vs {budget_to_date:,.0f} expected). Consider reallocating from an underspent line in {full_name}."
+        else:
+            msg = f"**{info['display_name']}** ({sheet_name}) — only {pct:.0f}% of its prorated budget used ({actual:,.0f} vs {budget_to_date:,.0f} expected). Budget here may be available to reallocate."
+        st.warning(msg)
+
+    if not flagged_any:
+        st.success("No line items are significantly off pace — everything falls within a normal range of its prorated budget.")
 # ---------------------------------------------------------------------------
 # Wizard navigation — each step must be confirmed before the next unlocks
 # ---------------------------------------------------------------------------
-STEP_NAMES = {1: "1. Contract Audit", 2: "2. Contract Classification", 3: "3. Actuals Upload", 4: "4. Forecasting"}
-nav_cols = st.columns(4)
+STEP_NAMES = {1: "1. Contract Audit", 2: "2. Contract Classification", 3: "3. Actuals Upload", 4: "4. Forecasting", 5: "5. Variance & Cohort Tracking"}
+nav_cols = st.columns(5)
 for step_num, label in STEP_NAMES.items():
     with nav_cols[step_num - 1]:
         is_current = st.session_state.wizard_step == step_num
@@ -1608,5 +1739,7 @@ elif st.session_state.wizard_step == 2:
     render_classification_mode()
 elif st.session_state.wizard_step == 3:
     render_actuals_upload_mode()
-else:
+elif st.session_state.wizard_step == 4:
     render_forecast_mode()
+else:
+    render_variance_mode()
