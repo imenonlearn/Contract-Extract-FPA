@@ -1490,23 +1490,40 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     actual_month_count = len(actuals_by_month)
     future_months = [m for m in year_months if m > through_month_idx]
 
+    monthly_values = {m: 0.0 for m in range(1, 13)}
+
     if budget_method == "flexible":
         remaining_period = max(int(duration_months) - actual_month_count, 1)
         new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+        for m in year_months:
+            if m < through_month_idx:
+                monthly_values[m] = actuals_by_month.get(m, 0.0)
+            elif m == through_month_idx:
+                monthly_values[m] = actuals_by_month.get(m, new_monthly_rate)
+            else:
+                monthly_values[m] = new_monthly_rate
+        display_total = sum(monthly_values.values())
     else:
-        remaining_period = max(len(future_months), 1)
-        new_monthly_rate = (orig_2026_budget - cumulative_actual) / remaining_period
-
-    monthly_values = {}
-    for m in range(1, 13):
-        if m not in year_months:
-            monthly_values[m] = 0.0
-        elif m < through_month_idx:
-            monthly_values[m] = actuals_by_month.get(m, 0.0)
-        elif m == through_month_idx:
-            monthly_values[m] = actuals_by_month.get(m, new_monthly_rate)
+        # Fixed: 2026 envelope never changes. No actuals → original monthly
+        # plan. After actuals → leftover envelope / months still left in 2026.
+        if actual_month_count == 0:
+            remaining_period = len(year_months) or 1
+            new_monthly_rate = flat_rate
+            for m in year_months:
+                monthly_values[m] = flat_rate
         else:
-            monthly_values[m] = new_monthly_rate
+            remaining_period = max(len(future_months), 1)
+            new_monthly_rate = (orig_2026_budget - cumulative_actual) / remaining_period
+            for m in year_months:
+                if m < through_month_idx:
+                    monthly_values[m] = actuals_by_month.get(m, 0.0)
+                elif m == through_month_idx:
+                    monthly_values[m] = actuals_by_month.get(m, 0.0)
+                else:
+                    monthly_values[m] = new_monthly_rate
+            if through_month_idx in year_months and through_month_idx not in actuals_by_month:
+                monthly_values[through_month_idx] = new_monthly_rate
+        display_total = orig_2026_budget
 
     meta = {
         "live": True,
@@ -1519,7 +1536,7 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "method": budget_method,
         "reason": "",
     }
-    return sum(monthly_values.values()), new_monthly_rate, year_months, monthly_values, meta
+    return display_total, new_monthly_rate, year_months, monthly_values, meta
 
 
 def render_forecast_mode():
@@ -1826,19 +1843,22 @@ def render_forecast_mode():
                     )
                     continue
 
-                default_total = round(total, 2) if total is not None else 0.0
-                # Key includes the freshly computed default so any correction above —
-                # or one made back in Audit mode's "Edit values" panel — shows up here
-                # immediately instead of the box being stuck on an old value.
-                amount_key = f"plan_total_{item['file']}_{default_total}"
+                orig_2026 = rf_meta.get("orig_2026_budget") or 0.0
+                method = rf_meta.get("method", "fixed")
+                locked_total = orig_2026 if method == "fixed" else (total or 0.0)
+                default_total = round(locked_total, 2) if locked_total is not None else 0.0
+                amount_key = f"plan_total_{item['file']}_{method}_{default_total}"
                 reviewer_total = st.number_input(
-                    f"Budgeted amount for {year} (pro-rated)", value=default_total, key=amount_key
+                    f"Budgeted amount for {year} (locked 2026 envelope)" if method == "fixed" else f"Budgeted amount for {year} (pro-rated)",
+                    value=default_total,
+                    key=amount_key,
+                    disabled=method == "fixed",
                 )
+                if method == "fixed":
+                    reviewer_total = default_total
                 active_months = active_months or []
                 monthly_values = monthly_values or {}
-                # If the reviewer overrode the total, rescale the monthly breakdown
-                # proportionally so the Excel write-out still sums to what they typed.
-                if monthly_values and total and abs(reviewer_total - total) > 0.01:
+                if method != "fixed" and monthly_values and total and abs(reviewer_total - total) > 0.01:
                     past = {m: v for m, v in monthly_values.items() if m <= through_month_idx}
                     future = {m: v for m, v in monthly_values.items() if m > through_month_idx}
                     leftover = reviewer_total - sum(past.values())
@@ -1851,8 +1871,6 @@ def render_forecast_mode():
                 n_act = rf_meta.get("actual_months", 0)
                 rem = rf_meta.get("remaining_period", 0)
                 cum = rf_meta.get("cumulative_actual", 0.0)
-                orig_2026 = rf_meta.get("orig_2026_budget") or 0.0
-                method = rf_meta.get("method", "fixed")
                 if recorded is not None and method == "fixed":
                     st.caption(
                         f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
