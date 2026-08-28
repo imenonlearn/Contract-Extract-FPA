@@ -1248,7 +1248,16 @@ def render_actuals_upload_mode():
             if dump_file.name.lower().endswith(".csv"):
                 df_dump = pd.read_csv(dump_file)
             else:
-                df_dump = pd.read_excel(dump_file, engine="openpyxl")
+                xls = pd.ExcelFile(dump_file, engine="openpyxl")
+                if len(xls.sheet_names) > 1:
+                    st.warning(
+                        f"This workbook has {len(xls.sheet_names)} sheets — pick the one with **raw, one-row-per-transaction data**. "
+                        "A pivot table or summary sheet will not work here."
+                    )
+                    sheet_name = st.selectbox("Sheet", xls.sheet_names, key="actuals_dump_sheet")
+                else:
+                    sheet_name = xls.sheet_names[0]
+                df_dump = pd.read_excel(xls, sheet_name=sheet_name)
         except Exception as e:
             st.error(f"Couldn't read this file: {e}")
             df_dump = None
@@ -1256,6 +1265,8 @@ def render_actuals_upload_mode():
         if df_dump is not None and df_dump.empty:
             st.warning("This file appears to be empty.")
         elif df_dump is not None:
+            st.caption("Preview of the first few rows — confirm this looks like raw transactions (one row per payment), not a pivot summary:")
+            st.markdown(df_dump.head(5).to_html(index=False), unsafe_allow_html=True)
             st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
             dump_columns = list(df_dump.columns)
             guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
@@ -1380,7 +1391,8 @@ def render_forecast_mode():
         df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
         match_col = account_col or dump_name_col
         actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, match_col, amount_col, year)
-        through_month = st.selectbox(
+        mc1, mc2 = st.columns([3, 1])
+        through_month = mc1.selectbox(
             "Actuals known through month",
             MONTH_NAMES,
             index=0,
@@ -1388,7 +1400,18 @@ def render_forecast_mode():
             help="For each contract, months up to and including this one use the real actual from your uploaded dump where one exists; the remaining budget is then re-spread over whatever contract months are left.",
         )
         through_month_idx = MONTH_NAMES.index(through_month) + 1
-        st.caption(f"Currently using actuals through **{through_month}** (month {through_month_idx}) — the cards below should change if you pick a different month.")
+        mc2.write("")  # vertical spacer to align button with selectbox
+        recomputed = mc2.button("🔄 Recompute", use_container_width=True)
+        if recomputed:
+            st.success(f"Recomputed using actuals through {through_month} ({year}).")
+
+        with st.expander(f"Debug: what's actually in the actuals lookup for {year}"):
+            st.caption(f"Matched on column: **{match_col}** · Total (name, month) entries found for {year}: **{len(actuals_lookup)}**")
+            if actuals_lookup:
+                debug_rows = [{"Counterparty (normalized)": k[0], "Month": MONTH_NAMES[k[1]-1], "Amount": v} for k, v in sorted(actuals_lookup.items())]
+                st.markdown(pd.DataFrame(debug_rows).to_html(index=False), unsafe_allow_html=True)
+            else:
+                st.warning(f"No actuals matched for year {year} — check the Date column actually contains {year} dates, and that '{match_col}' holds counterparty names.")
     else:
         st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
 
