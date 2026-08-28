@@ -45,6 +45,7 @@ PERSIST_KEYS = [
     "confirmed_account_names", "actuals_dump_mapping", "forecast_workbook_bytes",
     "forecast_sheets_touched", "forecast_budget_signature", "wizard_step",
     "max_unlocked_step", "placement_cache", "selected_source",
+    "budget_method", "fixed_budget_baseline",
 ]
 PERSIST_PREFIXES = (
     "override_", "reviewer_class_", "plan_heading_", "plan_sub_",
@@ -936,11 +937,27 @@ def guess_column(columns, keywords):
 
 
 def normalize_name(x) -> str:
-    return re.sub(r"\s+", " ", str(x).strip().lower())
+    text = str(x).strip().lower()
+    text = text.replace("l.l.c.", "llc").replace("l.l.c", "llc")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _flatten_columns(df):
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            " ".join(str(part) for part in tup if str(part).strip() and str(part).lower() not in ("nan", "none", "unnamed: 0"))
+            for tup in out.columns
+        ]
+    out.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in out.columns]
+    return out
 
 
 def _month_number_from_label(label):
     raw = str(label).strip().lower()
+    if raw.startswith("unnamed"):
+        return None
     text = re.sub(r"[^a-z0-9]", "", raw)
     if not text:
         return None
@@ -949,45 +966,78 @@ def _month_number_from_label(label):
         "july", "august", "september", "october", "november", "december",
     ]
     for i, name in enumerate(full, start=1):
-        if text == name or text.startswith(name[:3]):
+        if text == name or text == name[:3] or text.startswith(name):
             return i
-        if name in raw or name[:3] in raw:
+        if re.search(rf"\b{name[:3]}\b", raw) or re.search(rf"\b{name}\b", raw):
             return i
     return None
 
 
+def _add_lookup_value(lookup, name, month_num, val):
+    if not name or month_num is None:
+        return
+    try:
+        number = float(val)
+    except (TypeError, ValueError):
+        return
+    if pd.isna(number):
+        return
+    key = (name, month_num)
+    lookup[key] = lookup.get(key, 0.0) + number
+
+
 def build_monthly_actuals_lookup(df_dump, date_col, name_col, amount_col, year):
-    """Builds {(normalized_name, month_num): amount} from either a
-    transaction dump or a month-column pivot (Account Name x Jan/Feb/Mar)."""
-    df = df_dump.copy()
+    """Builds {(normalized_name, month_num): amount} from a transaction dump
+    or from a month-column pivot (Account Name × Jan/Feb/Mar)."""
+    df = _flatten_columns(df_dump)
     lookup = {}
 
-    if date_col in df.columns and amount_col in df.columns and name_col in df.columns:
+    candidate_name_cols = []
+    for col in (name_col,):
+        if col and col in df.columns:
+            candidate_name_cols.append(col)
+    for col in df.columns:
+        cl = str(col).lower()
+        if any(word in cl for word in ("account", "name", "vendor", "supplier", "counterparty", "entity")):
+            if col not in candidate_name_cols:
+                candidate_name_cols.append(col)
+
+    if date_col in df.columns and amount_col in df.columns:
         dated = df.copy()
         dated["_date"] = pd.to_datetime(dated[date_col], errors="coerce")
-        dated = dated[dated["_date"].dt.year == year]
-        if not dated.empty and dated["_date"].notna().any():
-            dated["_name_norm"] = dated[name_col].apply(normalize_name)
-            dated["_month"] = dated["_date"].dt.month
-            dated[amount_col] = pd.to_numeric(dated[amount_col], errors="coerce").fillna(0.0)
-            lookup.update(dated.groupby(["_name_norm", "_month"])[amount_col].sum().to_dict())
+        usable = dated[dated["_date"].notna()]
+        if year:
+            year_filtered = usable[usable["_date"].dt.year == year]
+            if not year_filtered.empty:
+                usable = year_filtered
+        for ncol in candidate_name_cols:
+            if ncol not in usable.columns:
+                continue
+            tmp = usable.copy()
+            tmp["_name_norm"] = tmp[ncol].apply(normalize_name)
+            tmp["_month"] = tmp["_date"].dt.month
+            tmp[amount_col] = pd.to_numeric(tmp[amount_col], errors="coerce")
+            tmp = tmp.dropna(subset=["_name_norm", amount_col])
+            for (nm, m), val in tmp.groupby(["_name_norm", "_month"])[amount_col].sum().items():
+                _add_lookup_value(lookup, nm, m, val)
 
     month_cols = {}
     for col in df.columns:
         month_num = _month_number_from_label(col)
         if month_num:
             month_cols[col] = month_num
-    if month_cols and name_col in df.columns:
-        for _, row in df.iterrows():
-            name = normalize_name(row.get(name_col, ""))
-            if not name:
+
+    if month_cols:
+        name_cols = candidate_name_cols or [c for c in df.columns if c not in month_cols]
+        for ncol in name_cols:
+            if ncol not in df.columns or ncol in month_cols:
                 continue
-            for col, month_num in month_cols.items():
-                val = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
-                if pd.isna(val):
+            for _, row in df.iterrows():
+                name = normalize_name(row.get(ncol, ""))
+                if not name or name in ("nan", "none", "total", "grand total"):
                     continue
-                key = (name, month_num)
-                lookup[key] = lookup.get(key, 0.0) + float(val)
+                for col, month_num in month_cols.items():
+                    _add_lookup_value(lookup, name, month_num, row[col])
 
     return lookup
 
@@ -1008,6 +1058,15 @@ def lookup_actual_amount(actuals_lookup, name_candidates, month):
             continue
         for n in norms:
             if n and (n in nm or nm in n):
+                return val
+    # Token overlap: "nomad stay homes llc" vs "nomad stay homes"
+    for (nm, m), val in actuals_lookup.items():
+        if m != month:
+            continue
+        nm_tokens = set(nm.split())
+        for n in norms:
+            tokens = set(n.split())
+            if len(tokens & nm_tokens) >= 2:
                 return val
     return None
 
@@ -1316,6 +1375,21 @@ def render_actuals_upload_mode():
                 else:
                     sheet_name = xls.sheet_names[0]
                 df_dump = pd.read_excel(xls, sheet_name=sheet_name)
+                df_dump = _flatten_columns(df_dump)
+                # If this looks like a titled pivot (months not in row 1), try the next header rows.
+                month_hits = sum(1 for c in df_dump.columns if _month_number_from_label(c))
+                if month_hits < 2:
+                    raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+                    best_df, best_hits = df_dump, month_hits
+                    for header_row in range(0, min(8, len(raw))):
+                        trial = raw.copy()
+                        trial.columns = [str(v) if pd.notna(v) else f"col_{i}" for i, v in enumerate(trial.iloc[header_row])]
+                        trial = trial.iloc[header_row + 1 :].reset_index(drop=True)
+                        trial = _flatten_columns(trial)
+                        hits = sum(1 for c in trial.columns if _month_number_from_label(c))
+                        if hits > best_hits:
+                            best_df, best_hits = trial, hits
+                    df_dump = best_df
         except Exception as e:
             st.error(f"Couldn't read this file: {e}")
             df_dump = None
@@ -1377,17 +1451,18 @@ def first_ready_month(effective_date, calendar_year):
     return int(ready.month)
 
 
-def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx):
-    """Hub71 planning rule (Nomad example):
+def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx, budget_method="fixed"):
+    """Fixed (default): remaining 2026 months =
+    (original 2026 budget − YTD actuals) / months left in 2026.
 
-    - Plan date = 1st of the chosen month. If the contract starts after that
-      date, the line is not live yet (all zeros / skip).
-    - Months before the chosen month: actual if posted, else 0.
-    - Chosen month: actual if posted, else the current forecast rate.
-    - Later months in the year: (original budget − cumulative actuals)
-      / (total contract months − number of months that already have actuals).
+    Flexible: remaining months =
+    (full contract value − YTD actuals) / (full term months − months with actuals).
     """
-    empty = {"live": False, "cumulative_actual": 0.0, "actual_months": 0, "remaining_period": 0}
+    empty = {
+        "live": False, "cumulative_actual": 0.0, "actual_months": 0,
+        "remaining_period": 0, "orig_2026_budget": 0.0, "orig_monthly_rate": 0.0,
+        "method": budget_method,
+    }
 
     _, flat_rate, active_months = compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year)
     if not active_months or flat_rate is None or contract_value is None or not duration_months:
@@ -1402,6 +1477,7 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
 
     ready_from = first_ready_month(effective_date, calendar_year) or 1
     year_months = [m for m in active_months if m >= ready_from]
+    orig_2026_budget = flat_rate * len(year_months)
 
     actuals_by_month = {}
     if actuals_lookup:
@@ -1412,12 +1488,18 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
 
     cumulative_actual = sum(actuals_by_month.values())
     actual_month_count = len(actuals_by_month)
-    remaining_period = max(int(duration_months) - actual_month_count, 1)
-    new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+    future_months = [m for m in year_months if m > through_month_idx]
+
+    if budget_method == "flexible":
+        remaining_period = max(int(duration_months) - actual_month_count, 1)
+        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+    else:
+        remaining_period = max(len(future_months), 1)
+        new_monthly_rate = (orig_2026_budget - cumulative_actual) / remaining_period
 
     monthly_values = {}
     for m in range(1, 13):
-        if m not in active_months or m < ready_from:
+        if m not in year_months:
             monthly_values[m] = 0.0
         elif m < through_month_idx:
             monthly_values[m] = actuals_by_month.get(m, 0.0)
@@ -1432,6 +1514,9 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "actual_months": actual_month_count,
         "remaining_period": remaining_period,
         "ready_from": ready_from,
+        "orig_2026_budget": orig_2026_budget,
+        "orig_monthly_rate": flat_rate,
+        "method": budget_method,
         "reason": "",
     }
     return sum(monthly_values.values()), new_monthly_rate, year_months, monthly_values, meta
@@ -1483,6 +1568,7 @@ def render_forecast_mode():
     actuals_lookup = None
     through_month_idx = 12
     through_month = None
+    budget_method = st.session_state.get("budget_method", "fixed")
     if dump_mapping:
         df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
         match_col = account_col or dump_name_col
@@ -1491,13 +1577,22 @@ def render_forecast_mode():
             extra = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
             for k, v in extra.items():
                 actuals_lookup.setdefault(k, v)
+        budget_method = st.radio(
+            "Budgeting method",
+            ["fixed", "flexible"],
+            index=0,
+            horizontal=True,
+            key="budget_method",
+            format_func=lambda x: "Fixed budgeting (2026 envelope)" if x == "fixed" else "Flexible budgeting (full contract term)",
+            help="Fixed: leftover 2026 budget is spread over months left in 2026. Flexible: leftover full contract value is spread over months left on the contract.",
+        )
         mc1, mc2 = st.columns([3, 1])
         through_month = mc1.selectbox(
             "Actuals known through month",
             MONTH_NAMES,
             index=0,
             key="forecast_through_month",
-            help="For each contract, months up to and including this one use the real actual from your uploaded dump where one exists; the remaining budget is then re-spread over whatever contract months are left.",
+            help="Months up to this one use posted actuals. Later months use the selected budgeting method.",
         )
         through_month_idx = MONTH_NAMES.index(through_month) + 1
         mc2.write("")  # vertical spacer to align button with selectbox
@@ -1505,13 +1600,19 @@ def render_forecast_mode():
         if recomputed:
             st.success(f"Recomputed using actuals through {through_month} ({year}).")
 
-        with st.expander(f"Debug: what's actually in the actuals lookup for {year}"):
-            st.caption(f"Matched on column: **{match_col}** · Total (name, month) entries found for {year}: **{len(actuals_lookup)}**")
+        if not actuals_lookup:
+            st.error(
+                "Actuals file is loaded, but no month amounts were read. "
+                "In Step 3 pick the sheet that looks like Account Name | Jan | Feb | Mar, "
+                "and set Account Name column to 'Account Name'. Then come back and click Recompute."
+            )
+        with st.expander(f"Debug: actuals lookup ({len(actuals_lookup or {})} entries)", expanded=not actuals_lookup):
+            st.caption(f"Matched on column: **{match_col}**")
             if actuals_lookup:
-                debug_rows = [{"Counterparty (normalized)": k[0], "Month": MONTH_NAMES[k[1]-1], "Amount": v} for k, v in sorted(actuals_lookup.items())]
+                debug_rows = [{"Name": k[0], "Month": MONTH_NAMES[k[1]-1], "Amount": v} for k, v in sorted(actuals_lookup.items())]
                 st.markdown(pd.DataFrame(debug_rows).to_html(index=False), unsafe_allow_html=True)
             else:
-                st.warning(f"No actuals matched for year {year} — check the Date column actually contains {year} dates, and that '{match_col}' holds counterparty names.")
+                st.warning("Lookup is empty — March cannot pick up 107,208 until this table has rows.")
     else:
         st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
 
@@ -1713,7 +1814,8 @@ def render_forecast_mode():
 
                 name_candidates = [item["counterparty"], chosen_account_name]
                 total, monthly_rate_calc, active_months, monthly_values, rf_meta = compute_reforecast(
-                    value, eff_date, duration, year, actuals_lookup, name_candidates, through_month_idx
+                    value, eff_date, duration, year, actuals_lookup, name_candidates, through_month_idx,
+                    budget_method=st.session_state.get("budget_method", "fixed"),
                 )
                 rf_meta = rf_meta or {}
 
@@ -1749,17 +1851,24 @@ def render_forecast_mode():
                 n_act = rf_meta.get("actual_months", 0)
                 rem = rf_meta.get("remaining_period", 0)
                 cum = rf_meta.get("cumulative_actual", 0.0)
-                if recorded is not None:
+                orig_2026 = rf_meta.get("orig_2026_budget") or 0.0
+                method = rf_meta.get("method", "fixed")
+                if recorded is not None and method == "fixed":
                     st.caption(
                         f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
-                        f"Remaining rate = ({value:,.0f} − {cum:,.0f}) / ({int(duration)} − {n_act}) "
+                        f"Fixed rate = ({orig_2026:,.0f} − {cum:,.0f}) / {rem} remaining 2026 months "
+                        f"= {monthly_rate_calc:,.2f}/month."
+                    )
+                elif recorded is not None:
+                    st.caption(
+                        f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
+                        f"Flexible rate = ({value:,.0f} − {cum:,.0f}) / ({int(duration)} − {n_act}) "
                         f"= {monthly_rate_calc:,.2f}/month."
                     )
                 elif monthly_rate_calc:
                     st.caption(
                         f"No {MONTH_NAMES[through_month_idx-1]} actual posted. "
-                        f"Rate = {value:,.0f} / {int(duration)} = {monthly_rate_calc:,.2f}/month "
-                        f"from {MONTH_NAMES[through_month_idx-1]} through Dec."
+                        f"Original 2026 monthly rate = {rf_meta.get('orig_monthly_rate', monthly_rate_calc):,.2f}."
                     )
                 else:
                     st.caption("Could not compute a monthly rate — check Effective Date, Term, and Contract Value.")
@@ -1772,6 +1881,9 @@ def render_forecast_mode():
                     "active_months": active_months or list(range(1, 13)),
                     "monthly_values": monthly_values,
                     "account_name": chosen_account_name,
+                    "orig_2026_budget": rf_meta.get("orig_2026_budget", 0.0),
+                    "orig_monthly_rate": rf_meta.get("orig_monthly_rate", 0.0),
+                    "ready_from": rf_meta.get("ready_from", 1),
                 })
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
@@ -1780,6 +1892,19 @@ def render_forecast_mode():
         st.session_state.forecast_workbook_bytes = workbook_bytes
         st.session_state.forecast_sheets_touched = list(plan_by_sheet.keys())
         st.session_state.max_unlocked_step = max(st.session_state.max_unlocked_step, 5)
+        baseline = {}
+        for items in plan_by_sheet.values():
+            for ins in items:
+                rate = ins.get("orig_monthly_rate") or 0.0
+                ready = ins.get("ready_from") or 1
+                orig_months = {m: (rate if m >= ready else 0.0) for m in range(1, 13)}
+                baseline[normalize_name(ins["counterparty"])] = {
+                    "orig_2026": ins.get("orig_2026_budget") or 0.0,
+                    "orig_monthly_rate": rate,
+                    "orig_months": orig_months,
+                    "display_name": ins["counterparty"],
+                }
+        st.session_state.fixed_budget_baseline = baseline
 
     if st.session_state.get("forecast_workbook_bytes"):
         st.markdown('<div class="step-label">Updated sheets</div>', unsafe_allow_html=True)
@@ -1908,6 +2033,47 @@ def render_variance_mode():
             sign = "+" if variance > 0 else ""
             cols[4].markdown(f":{color}[**{label}**]")
             cols[4].caption(f"Variance: {sign}{variance:,.0f}")
+
+    st.markdown('<div class="step-label">Month flags vs original 2026 plan</div>', unsafe_allow_html=True)
+    st.caption("Compares the chosen month's actual with the original monthly budget (not the reforecasted figure).")
+    baseline = st.session_state.get("fixed_budget_baseline") or {}
+    monthly_lookup = build_monthly_actuals_lookup(df_dump, date_col, match_col, amount_col, year)
+    if account_col and account_col != dump_name_col:
+        extra = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
+        for k, v in extra.items():
+            monthly_lookup.setdefault(k, v)
+    month_flagged = False
+    names_to_check = set(line_item_to_sheet.keys()) | set(baseline.keys())
+    for name_norm in sorted(names_to_check):
+        actual_m = lookup_actual_amount(monthly_lookup, [name_norm], through_idx)
+        if actual_m is None:
+            continue
+        orig_rate = (baseline.get(name_norm) or {}).get("orig_monthly_rate")
+        display = (baseline.get(name_norm) or {}).get("display_name") or name_norm
+        if not orig_rate:
+            info = next((v for (s, n), v in line_item_budget.items() if n == name_norm), None)
+            if info:
+                live_months = 12
+                orig_rate = (info["annual"] / live_months) if info["annual"] else 0
+                display = info["display_name"]
+        if not orig_rate:
+            continue
+        pct = actual_m / orig_rate * 100
+        if pct > 150:
+            month_flagged = True
+            st.error(
+                f"**{display}** — {MONTH_NAMES[through_idx-1]} actual {actual_m:,.0f} is "
+                f"{pct:.0f}% of the original monthly budget {orig_rate:,.0f} "
+                f"(about {pct/100:.1f}× planned)."
+            )
+        elif pct > 115:
+            month_flagged = True
+            st.warning(
+                f"**{display}** — {MONTH_NAMES[through_idx-1]} actual {actual_m:,.0f} is "
+                f"{pct:.0f}% of the original monthly budget {orig_rate:,.0f}."
+            )
+    if not month_flagged:
+        st.success(f"No line is far over its original {through_month} budget.")
 
     st.markdown('<div class="step-label">Line items to review</div>', unsafe_allow_html=True)
     st.caption("Flagged when a line's actual spend to date is well outside its own prorated budget — possible candidates for reallocating budget between lines.")
