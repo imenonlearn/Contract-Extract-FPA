@@ -1361,43 +1361,80 @@ def render_actuals_upload_mode():
         st.rerun()
 
 
+def first_ready_month(effective_date, calendar_year):
+    """Plans are made on the 1st. A mid-month start (e.g. 15 Jan) is first
+    included when the planner stands on 1 Feb."""
+    if effective_date is None:
+        return None
+    if effective_date.day <= 1:
+        ready = pd.Timestamp(year=effective_date.year, month=effective_date.month, day=1)
+    else:
+        ready = pd.Timestamp(year=effective_date.year, month=effective_date.month, day=1) + pd.DateOffset(months=1)
+    if ready.year > calendar_year:
+        return 13
+    if ready.year < calendar_year:
+        return 1
+    return int(ready.month)
+
+
 def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx):
-    """Months through the chosen month: actual if present, else 0.
-    Months after that still in the contract:
-    (original budget − cumulative actuals through chosen month) / remaining months.
+    """Hub71 planning rule (Nomad example):
+
+    - Plan date = 1st of the chosen month. If the contract starts after that
+      date, the line is not live yet (all zeros / skip).
+    - Months before the chosen month: actual if posted, else 0.
+    - Chosen month: actual if posted, else the current forecast rate.
+    - Later months in the year: (original budget − cumulative actuals)
+      / (total contract months − number of months that already have actuals).
     """
+    empty = {"live": False, "cumulative_actual": 0.0, "actual_months": 0, "remaining_period": 0}
+
     _, flat_rate, active_months = compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year)
-    if not active_months or flat_rate is None or contract_value is None:
-        return None, None, [], {}
+    if not active_months or flat_rate is None or contract_value is None or not duration_months:
+        return None, None, [], {}, empty
 
-    if not actuals_lookup:
-        monthly_values = {m: flat_rate for m in active_months}
-        return flat_rate * len(active_months), flat_rate, active_months, monthly_values
+    planning_date = pd.Timestamp(year=calendar_year, month=through_month_idx, day=1)
+    if effective_date is not None and planning_date < pd.Timestamp(effective_date).normalize():
+        monthly_values = {m: 0.0 for m in range(1, 13)}
+        meta = dict(empty)
+        meta["reason"] = f"Not live on {planning_date.strftime('%d %b %Y')} — starts {pd.Timestamp(effective_date).strftime('%d %b %Y')}"
+        return 0.0, 0.0, [], monthly_values, meta
 
-    past_months = [m for m in active_months if m <= through_month_idx]
-    future_months = [m for m in active_months if m > through_month_idx]
+    ready_from = first_ready_month(effective_date, calendar_year) or 1
+    year_months = [m for m in active_months if m >= ready_from]
+
+    actuals_by_month = {}
+    if actuals_lookup:
+        for m in range(1, through_month_idx + 1):
+            val = lookup_actual_amount(actuals_lookup, name_candidates, m)
+            if val is not None:
+                actuals_by_month[m] = float(val)
+
+    cumulative_actual = sum(actuals_by_month.values())
+    actual_month_count = len(actuals_by_month)
+    remaining_period = max(int(duration_months) - actual_month_count, 1)
+    new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
 
     monthly_values = {}
-    cumulative_actual = 0.0
-    for m in past_months:
-        actual_val = lookup_actual_amount(actuals_lookup, name_candidates, m)
-        if actual_val is None:
+    for m in range(1, 13):
+        if m not in active_months or m < ready_from:
             monthly_values[m] = 0.0
+        elif m < through_month_idx:
+            monthly_values[m] = actuals_by_month.get(m, 0.0)
+        elif m == through_month_idx:
+            monthly_values[m] = actuals_by_month.get(m, new_monthly_rate)
         else:
-            monthly_values[m] = float(actual_val)
-            cumulative_actual += float(actual_val)
-
-    remaining_period = len(future_months)
-    if remaining_period <= 0:
-        remaining_period = max(int(duration_months) - len(past_months), 1)
-        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
-    else:
-        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
-        for m in future_months:
             monthly_values[m] = new_monthly_rate
 
-    total_for_year = sum(monthly_values.values())
-    return total_for_year, new_monthly_rate, active_months, monthly_values
+    meta = {
+        "live": True,
+        "cumulative_actual": cumulative_actual,
+        "actual_months": actual_month_count,
+        "remaining_period": remaining_period,
+        "ready_from": ready_from,
+        "reason": "",
+    }
+    return sum(monthly_values.values()), new_monthly_rate, year_months, monthly_values, meta
 
 
 def render_forecast_mode():
@@ -1675,9 +1712,17 @@ def render_forecast_mode():
                     chosen_account_name = "" if chosen_account_name == "(none)" else chosen_account_name
 
                 name_candidates = [item["counterparty"], chosen_account_name]
-                total, monthly_rate_calc, active_months, monthly_values = compute_reforecast(
+                total, monthly_rate_calc, active_months, monthly_values, rf_meta = compute_reforecast(
                     value, eff_date, duration, year, actuals_lookup, name_candidates, through_month_idx
                 )
+                rf_meta = rf_meta or {}
+
+                if not rf_meta.get("live", True):
+                    st.info(
+                        rf_meta.get("reason")
+                        or "Not live on the 1st of the chosen month — no budget line this period."
+                    )
+                    continue
 
                 default_total = round(total, 2) if total is not None else 0.0
                 # Key includes the freshly computed default so any correction above —
@@ -1700,23 +1745,24 @@ def render_forecast_mode():
                         monthly_values = {**past, **{m: each for m in future}}
                         monthly_rate_calc = each
 
-                if actuals_lookup and monthly_values:
-                    chosen_val = monthly_values.get(through_month_idx)
-                    recorded = lookup_actual_amount(actuals_lookup, name_candidates, through_month_idx)
-                    if recorded is not None:
-                        st.caption(
-                            f"{MONTH_NAMES[through_month_idx-1]} uses the recorded actual: {recorded:,.2f}. "
-                            f"Later months: (budget − spend through {MONTH_NAMES[through_month_idx-1]}) "
-                            f"/ remaining months ≈ {monthly_rate_calc:,.2f}/month."
-                        )
-                    else:
-                        st.caption(
-                            f"No actual found for {item['counterparty']} in {MONTH_NAMES[through_month_idx-1]}. "
-                            f"Check Step 3 column mapping, or pick the matching Account Name above."
-                        )
+                recorded = lookup_actual_amount(actuals_lookup, name_candidates, through_month_idx) if actuals_lookup else None
+                n_act = rf_meta.get("actual_months", 0)
+                rem = rf_meta.get("remaining_period", 0)
+                cum = rf_meta.get("cumulative_actual", 0.0)
+                if recorded is not None:
+                    st.caption(
+                        f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
+                        f"Remaining rate = ({value:,.0f} − {cum:,.0f}) / ({int(duration)} − {n_act}) "
+                        f"= {monthly_rate_calc:,.2f}/month."
+                    )
+                elif monthly_rate_calc:
+                    st.caption(
+                        f"No {MONTH_NAMES[through_month_idx-1]} actual posted. "
+                        f"Rate = {value:,.0f} / {int(duration)} = {monthly_rate_calc:,.2f}/month "
+                        f"from {MONTH_NAMES[through_month_idx-1]} through Dec."
+                    )
                 else:
-                    months_left = len(active_months) if active_months else 0
-                    st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate_calc:,.2f}/month" if monthly_rate_calc else "")
+                    st.caption("Could not compute a monthly rate — check Effective Date, Term, and Contract Value.")
 
                 plan_by_sheet.setdefault(item["category"], []).append({
                     "counterparty": item["counterparty"],
