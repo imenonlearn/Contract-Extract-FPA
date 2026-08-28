@@ -936,22 +936,80 @@ def guess_column(columns, keywords):
 
 
 def normalize_name(x) -> str:
-    return str(x).strip().lower()
+    return re.sub(r"\s+", " ", str(x).strip().lower())
+
+
+def _month_number_from_label(label):
+    raw = str(label).strip().lower()
+    text = re.sub(r"[^a-z0-9]", "", raw)
+    if not text:
+        return None
+    full = [
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ]
+    for i, name in enumerate(full, start=1):
+        if text == name or text.startswith(name[:3]):
+            return i
+        if name in raw or name[:3] in raw:
+            return i
+    return None
 
 
 def build_monthly_actuals_lookup(df_dump, date_col, name_col, amount_col, year):
-    """Aggregates a transaction-level actuals dump into {(normalized_name, month_num): amount}."""
+    """Builds {(normalized_name, month_num): amount} from either a
+    transaction dump or a month-column pivot (Account Name x Jan/Feb/Mar)."""
     df = df_dump.copy()
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df[df[date_col].dt.year == year]
-    df["_name_norm"] = df[name_col].apply(normalize_name)
-    df["_month"] = df[date_col].dt.month
-    try:
-        df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
-    except Exception:
-        pass
-    grouped = df.groupby(["_name_norm", "_month"])[amount_col].sum()
-    return grouped.to_dict()
+    lookup = {}
+
+    if date_col in df.columns and amount_col in df.columns and name_col in df.columns:
+        dated = df.copy()
+        dated["_date"] = pd.to_datetime(dated[date_col], errors="coerce")
+        dated = dated[dated["_date"].dt.year == year]
+        if not dated.empty and dated["_date"].notna().any():
+            dated["_name_norm"] = dated[name_col].apply(normalize_name)
+            dated["_month"] = dated["_date"].dt.month
+            dated[amount_col] = pd.to_numeric(dated[amount_col], errors="coerce").fillna(0.0)
+            lookup.update(dated.groupby(["_name_norm", "_month"])[amount_col].sum().to_dict())
+
+    month_cols = {}
+    for col in df.columns:
+        month_num = _month_number_from_label(col)
+        if month_num:
+            month_cols[col] = month_num
+    if month_cols and name_col in df.columns:
+        for _, row in df.iterrows():
+            name = normalize_name(row.get(name_col, ""))
+            if not name:
+                continue
+            for col, month_num in month_cols.items():
+                val = pd.to_numeric(pd.Series([row[col]]), errors="coerce").iloc[0]
+                if pd.isna(val):
+                    continue
+                key = (name, month_num)
+                lookup[key] = lookup.get(key, 0.0) + float(val)
+
+    return lookup
+
+
+def lookup_actual_amount(actuals_lookup, name_candidates, month):
+    if not actuals_lookup:
+        return None
+    norms = []
+    for n in name_candidates:
+        if n is None or str(n).strip() == "":
+            continue
+        norms.append(normalize_name(n))
+    for n in norms:
+        if (n, month) in actuals_lookup:
+            return actuals_lookup[(n, month)]
+    for (nm, m), val in actuals_lookup.items():
+        if m != month:
+            continue
+        for n in norms:
+            if n and (n in nm or nm in n):
+                return val
+    return None
 
 
 CATEGORY_ABBREVIATIONS = list(CLASSIFICATION_CATEGORIES.keys())
@@ -1303,41 +1361,39 @@ def render_actuals_upload_mode():
         st.rerun()
 
 
-def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, counterparty_norm, through_month_idx):
-    """Blends real actuals (from the dump) with a reforecast for the remaining
-    contract period. 'Remaining period' only counts months that actually have
-    a recorded actual — sensible for instalment-based contracts where most
-    months have no scheduled payment at all.
-
-    Returns (total_for_year, new_monthly_rate, active_months, monthly_values)
-    where monthly_values is {month_num: value_to_use} for every active month —
-    the real actual where one's on record through the chosen month, the
-    reforecast rate everywhere else."""
+def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx):
+    """Months through the chosen month: actual if present, else 0.
+    Months after that still in the contract:
+    (original budget − cumulative actuals through chosen month) / remaining months.
+    """
     _, flat_rate, active_months = compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year)
-    if not active_months or flat_rate is None:
+    if not active_months or flat_rate is None or contract_value is None:
         return None, None, [], {}
 
     if not actuals_lookup:
         monthly_values = {m: flat_rate for m in active_months}
         return flat_rate * len(active_months), flat_rate, active_months, monthly_values
 
+    past_months = [m for m in active_months if m <= through_month_idx]
+    future_months = [m for m in active_months if m > through_month_idx]
+
     monthly_values = {}
-    months_with_actual = []
     cumulative_actual = 0.0
-    for m in active_months:
-        if m <= through_month_idx:
-            actual_val = actuals_lookup.get((counterparty_norm, m))
-            if actual_val is not None:
-                monthly_values[m] = actual_val
-                months_with_actual.append(m)
-                cumulative_actual += actual_val
+    for m in past_months:
+        actual_val = lookup_actual_amount(actuals_lookup, name_candidates, m)
+        if actual_val is None:
+            monthly_values[m] = 0.0
+        else:
+            monthly_values[m] = float(actual_val)
+            cumulative_actual += float(actual_val)
 
-    remaining_period = max(duration_months - len(months_with_actual), 1)
-    remaining_budget = contract_value - cumulative_actual
-    new_monthly_rate = remaining_budget / remaining_period
-
-    for m in active_months:
-        if m not in monthly_values:
+    remaining_period = len(future_months)
+    if remaining_period <= 0:
+        remaining_period = max(int(duration_months) - len(past_months), 1)
+        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+    else:
+        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+        for m in future_months:
             monthly_values[m] = new_monthly_rate
 
     total_for_year = sum(monthly_values.values())
@@ -1394,6 +1450,10 @@ def render_forecast_mode():
         df_dump, date_col, dump_name_col, amount_col, account_col = dump_mapping
         match_col = account_col or dump_name_col
         actuals_lookup = build_monthly_actuals_lookup(df_dump, date_col, match_col, amount_col, year)
+        if account_col and account_col != dump_name_col:
+            extra = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
+            for k, v in extra.items():
+                actuals_lookup.setdefault(k, v)
         mc1, mc2 = st.columns([3, 1])
         through_month = mc1.selectbox(
             "Actuals known through month",
@@ -1582,10 +1642,6 @@ def render_forecast_mode():
                         value = entered
                         st.session_state[f"override_{row_idx}_Contract Value"] = str(entered)
 
-                total, monthly_rate_calc, active_months, monthly_values = compute_reforecast(
-                    value, eff_date, duration, year, actuals_lookup, normalize_name(item["counterparty"]), through_month_idx
-                )
-
                 still_missing = []
                 if eff_date is None:
                     still_missing.append("Effective Date")
@@ -1618,6 +1674,11 @@ def render_forecast_mode():
                     chosen_account_name = st.selectbox("Account Name (from Actuals Upload)", account_options, index=0, key=f"plan_account_{item['file']}")
                     chosen_account_name = "" if chosen_account_name == "(none)" else chosen_account_name
 
+                name_candidates = [item["counterparty"], chosen_account_name]
+                total, monthly_rate_calc, active_months, monthly_values = compute_reforecast(
+                    value, eff_date, duration, year, actuals_lookup, name_candidates, through_month_idx
+                )
+
                 default_total = round(total, 2) if total is not None else 0.0
                 # Key includes the freshly computed default so any correction above —
                 # or one made back in Audit mode's "Edit values" panel — shows up here
@@ -1631,16 +1692,28 @@ def render_forecast_mode():
                 # If the reviewer overrode the total, rescale the monthly breakdown
                 # proportionally so the Excel write-out still sums to what they typed.
                 if monthly_values and total and abs(reviewer_total - total) > 0.01:
-                    scale = reviewer_total / total
-                    monthly_values = {m: v * scale for m, v in monthly_values.items()}
+                    past = {m: v for m, v in monthly_values.items() if m <= through_month_idx}
+                    future = {m: v for m, v in monthly_values.items() if m > through_month_idx}
+                    leftover = reviewer_total - sum(past.values())
+                    if future:
+                        each = leftover / len(future)
+                        monthly_values = {**past, **{m: each for m in future}}
+                        monthly_rate_calc = each
 
                 if actuals_lookup and monthly_values:
                     chosen_val = monthly_values.get(through_month_idx)
-                    is_actual = chosen_val is not None and actuals_lookup.get((normalize_name(item["counterparty"]), through_month_idx)) == chosen_val
-                    if is_actual:
-                        st.caption(f"{MONTH_NAMES[through_month_idx-1]} uses the recorded actual: {chosen_val:,.2f}. Remaining months reforecast at ~{monthly_rate_calc:,.2f}/month.")
+                    recorded = lookup_actual_amount(actuals_lookup, name_candidates, through_month_idx)
+                    if recorded is not None:
+                        st.caption(
+                            f"{MONTH_NAMES[through_month_idx-1]} uses the recorded actual: {recorded:,.2f}. "
+                            f"Later months: (budget − spend through {MONTH_NAMES[through_month_idx-1]}) "
+                            f"/ remaining months ≈ {monthly_rate_calc:,.2f}/month."
+                        )
                     else:
-                        st.caption(f"No actual recorded yet for {item['counterparty']} — using the flat rate ~{monthly_rate_calc:,.2f}/month.")
+                        st.caption(
+                            f"No actual found for {item['counterparty']} in {MONTH_NAMES[through_month_idx-1]}. "
+                            f"Check Step 3 column mapping, or pick the matching Account Name above."
+                        )
                 else:
                     months_left = len(active_months) if active_months else 0
                     st.caption(f"Spread across {months_left} active month(s) in {year}: ~{monthly_rate_calc:,.2f}/month" if monthly_rate_calc else "")
