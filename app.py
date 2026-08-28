@@ -1384,9 +1384,11 @@ def render_forecast_mode():
             "Actuals known through month",
             MONTH_NAMES,
             index=0,
+            key="forecast_through_month",
             help="For each contract, months up to and including this one use the real actual from your uploaded dump where one exists; the remaining budget is then re-spread over whatever contract months are left.",
         )
         through_month_idx = MONTH_NAMES.index(through_month) + 1
+        st.caption(f"Currently using actuals through **{through_month}** (month {through_month_idx}) — the cards below should change if you pick a different month.")
     else:
         st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
 
