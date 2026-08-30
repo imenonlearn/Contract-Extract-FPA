@@ -46,6 +46,8 @@ PERSIST_KEYS = [
     "forecast_sheets_touched", "forecast_budget_signature", "wizard_step",
     "max_unlocked_step", "placement_cache", "selected_source",
     "budget_method", "fixed_budget_baseline",
+    "forecast_budget_bytes", "forecast_budget_name",
+    "forecast_through_month", "forecast_year",
 ]
 PERSIST_PREFIXES = (
     "override_", "reviewer_class_", "plan_heading_", "plan_sub_",
@@ -1297,9 +1299,9 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
                 col = MONTH_COL_START + (m - 1)
                 ins_monthly_values = ins.get("monthly_values") or {}
                 if m in ins_monthly_values:
-                    ws.cell(row=row, column=col).value = round(ins_monthly_values[m], 2)
+                    ws.cell(row=row, column=col).value = max(round(ins_monthly_values[m], 2), 0)
                 elif m in ins["active_months"]:
-                    ws.cell(row=row, column=col).value = round(ins["monthly_rate"], 2)
+                    ws.cell(row=row, column=col).value = max(round(ins["monthly_rate"], 2), 0)
                 else:
                     ws.cell(row=row, column=col).value = 0
 
@@ -1492,20 +1494,28 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
 
+    insufficient = False
+    leftover = 0.0
     if budget_method == "flexible":
+        leftover = contract_value - cumulative_actual
         remaining_period = max(int(duration_months) - actual_month_count, 1)
-        new_monthly_rate = (contract_value - cumulative_actual) / remaining_period
+        if leftover < 0:
+            insufficient = True
+            new_monthly_rate = 0.0
+        else:
+            new_monthly_rate = leftover / remaining_period
         for m in year_months:
             if m < through_month_idx:
-                monthly_values[m] = actuals_by_month.get(m, 0.0)
+                monthly_values[m] = max(actuals_by_month.get(m, 0.0), 0.0)
             elif m == through_month_idx:
-                monthly_values[m] = actuals_by_month.get(m, new_monthly_rate)
+                monthly_values[m] = max(actuals_by_month.get(m, new_monthly_rate), 0.0)
             else:
                 monthly_values[m] = new_monthly_rate
         display_total = sum(monthly_values.values())
     else:
-        # Fixed: 2026 envelope never changes. No actuals → original monthly
-        # plan. After actuals → leftover envelope / months still left in 2026.
+        leftover = orig_2026_budget - cumulative_actual
+        if leftover < 0:
+            insufficient = True
         if actual_month_count == 0:
             remaining_period = len(year_months) or 1
             new_monthly_rate = flat_rate
@@ -1513,15 +1523,13 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
                 monthly_values[m] = flat_rate
         else:
             remaining_period = max(len(future_months), 1)
-            new_monthly_rate = (orig_2026_budget - cumulative_actual) / remaining_period
+            new_monthly_rate = leftover / remaining_period if leftover > 0 else 0.0
             for m in year_months:
-                if m < through_month_idx:
-                    monthly_values[m] = actuals_by_month.get(m, 0.0)
-                elif m == through_month_idx:
-                    monthly_values[m] = actuals_by_month.get(m, 0.0)
+                if m <= through_month_idx:
+                    monthly_values[m] = max(actuals_by_month.get(m, 0.0), 0.0)
                 else:
                     monthly_values[m] = new_monthly_rate
-            if through_month_idx in year_months and through_month_idx not in actuals_by_month:
+            if through_month_idx in year_months and through_month_idx not in actuals_by_month and leftover > 0:
                 monthly_values[through_month_idx] = new_monthly_rate
         display_total = orig_2026_budget
 
@@ -1534,6 +1542,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "orig_2026_budget": orig_2026_budget,
         "orig_monthly_rate": flat_rate,
         "method": budget_method,
+        "insufficient": insufficient,
+        "leftover": leftover,
         "reason": "",
     }
     return display_total, new_monthly_rate, year_months, monthly_values, meta
@@ -1557,12 +1567,43 @@ def render_forecast_mode():
 
     st.markdown('<div class="step-label">1 · Upload your budget workbook</div>', unsafe_allow_html=True)
     budget_file = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], label_visibility="collapsed", key="forecast_budget_file")
-    if not budget_file:
+    if budget_file is not None:
+        st.session_state.forecast_budget_bytes = budget_file.getvalue()
+        st.session_state.forecast_budget_name = budget_file.name
+
+    budget_bytes = st.session_state.get("forecast_budget_bytes")
+    if budget_file is None and budget_bytes:
+        st.caption(f"Using last uploaded workbook: **{st.session_state.get('forecast_budget_name', 'budget.xlsx')}** (kept until you Clear or upload a new file).")
+    if not budget_bytes:
         st.info("Upload the Hub71 budget workbook (sheets named CO / GS / CS / MM, with purple heading rows and grey subheading rows).")
+        if st.session_state.get("forecast_workbook_bytes"):
+            st.markdown('<div class="step-label">Last applied forecast</div>', unsafe_allow_html=True)
+            result_wb = openpyxl.load_workbook(io.BytesIO(st.session_state.forecast_workbook_bytes), data_only=False)
+            for sheet_name in st.session_state.get("forecast_sheets_touched") or result_wb.sheetnames:
+                if sheet_name not in result_wb.sheetnames:
+                    continue
+                ws = result_wb[sheet_name]
+                st.caption(f"**{sheet_name}**")
+                rows_out = []
+                for row in range(3, ws.max_row + 1):
+                    name = ws.cell(row=row, column=1).value
+                    if name is None:
+                        continue
+                    budget = ws.cell(row=row, column=2).value
+                    month_vals = [ws.cell(row=row, column=4 + m).value for m in range(12)]
+                    rows_out.append([name, budget] + month_vals)
+                preview_df = pd.DataFrame(rows_out, columns=["Line Item", "Budget"] + MONTH_NAMES)
+                st.markdown(preview_df.to_html(index=False, escape=False, na_rep=""), unsafe_allow_html=True)
+            st.download_button(
+                "Download last updated workbook",
+                data=st.session_state.forecast_workbook_bytes,
+                file_name="budget_updated.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
         return
 
     try:
-        wb = openpyxl.load_workbook(budget_file, data_only=False)
+        wb = openpyxl.load_workbook(io.BytesIO(budget_bytes), data_only=False)
     except Exception as e:
         st.error(f"Couldn't read this workbook: {e}")
         return
@@ -1571,7 +1612,7 @@ def render_forecast_mode():
     # month" all invalidate any previously generated output — otherwise a
     # stale download could silently persist even after everything upstream
     # has changed. The signature is finalized once through_month is known.
-    year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1)
+    year = st.number_input("Calendar year this budget covers", min_value=2020, max_value=2100, value=2026, step=1, key="forecast_year")
 
     import hashlib
     dump_mapping = st.session_state.get("actuals_dump_mapping")
@@ -1633,11 +1674,8 @@ def render_forecast_mode():
     else:
         st.caption("No actuals dump loaded (Step 3) — using the flat pro-rated calculation for every contract.")
 
-    file_signature = hashlib.md5(budget_file.getvalue()).hexdigest() + f"::{year}::{dump_fingerprint}::{through_month_idx}"
-    if st.session_state.get("forecast_budget_signature") != file_signature:
-        st.session_state.pop("forecast_workbook_bytes", None)
-        st.session_state.pop("forecast_sheets_touched", None)
-        st.session_state["forecast_budget_signature"] = file_signature
+    file_signature = hashlib.md5(budget_bytes).hexdigest() + f"::{year}::{dump_fingerprint}::{through_month_idx}"
+    st.session_state["forecast_budget_signature"] = file_signature
 
     # Build the sheet structure once so we can match categories to real sheets and show existing headings.
     sheet_data = {}
@@ -1867,10 +1905,19 @@ def render_forecast_mode():
                         monthly_values = {**past, **{m: each for m in future}}
                         monthly_rate_calc = each
 
+                monthly_values = {m: max(float(v), 0.0) for m, v in monthly_values.items()}
                 recorded = lookup_actual_amount(actuals_lookup, name_candidates, through_month_idx) if actuals_lookup else None
                 n_act = rf_meta.get("actual_months", 0)
                 rem = rf_meta.get("remaining_period", 0)
                 cum = rf_meta.get("cumulative_actual", 0.0)
+                if rf_meta.get("insufficient"):
+                    over = cum - (orig_2026 if method == "fixed" else (value or 0.0))
+                    st.error(
+                        f"Budget insufficient for **{item['counterparty']}**. "
+                        f"Actuals to {MONTH_NAMES[through_month_idx-1]} are {cum:,.2f} versus "
+                        f"{'2026 budget ' + format(orig_2026, ',.0f') if method == 'fixed' else 'contract value ' + format(value or 0, ',.0f')}. "
+                        f"Overspent by {over:,.2f}. Remaining months are set to 0 — no negative figures."
+                    )
                 if recorded is not None and method == "fixed":
                     st.caption(
                         f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
