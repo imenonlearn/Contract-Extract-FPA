@@ -1576,15 +1576,21 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         return 0.0, 0.0, [], monthly_values, meta
 
     ready_from = first_ready_month(effective_date, calendar_year) or 1
-    year_months = [m for m in active_months if m >= ready_from]
-    orig_2026_budget = flat_rate * len(year_months)
 
     actuals_by_month = {}
     if actuals_lookup:
-        for m in range(1, through_month_idx + 1):
+        for m in range(1, 13):
             val = lookup_actual_amount(actuals_lookup, name_candidates, m)
             if val is not None:
                 actuals_by_month[m] = float(val)
+
+    # Mid-month starts (Nomad 15 Jan) stay out of that first month unless
+    # an actual was posted there (Meridian 42,000 in January).
+    if effective_date is not None and int(effective_date.month) in actuals_by_month:
+        ready_from = min(ready_from, int(effective_date.month))
+
+    year_months = sorted(set(m for m in active_months if m >= ready_from) | set(actuals_by_month))
+    orig_2026_budget = flat_rate * len(year_months)
 
     cumulative_actual = sum(actuals_by_month.values())
     actual_month_count = len(actuals_by_month)
