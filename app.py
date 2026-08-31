@@ -200,11 +200,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or get_secret("OPENAI_API_KEY"
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-st.markdown('<div class="app-title">Contract Terms Extract</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="app-subtitle">Upload contracts, define the terms you need, get a clean summary table.</div>',
-    unsafe_allow_html=True,
-)
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hlb_hamt_logo.png")
+hdr_logo, hdr_text = st.columns([1.1, 5])
+with hdr_logo:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_container_width=True)
+with hdr_text:
+    st.markdown('<div class="app-title">Contract Terms Extract</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="app-subtitle">Upload contracts, define the terms you need, get a clean summary table.</div>',
+        unsafe_allow_html=True,
+    )
 
 if not OPENAI_API_KEY:
     st.error(
@@ -213,6 +219,9 @@ if not OPENAI_API_KEY:
     )
 
 with st.sidebar:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_container_width=True)
+        st.divider()
     st.caption("STATUS")
     if OPENAI_API_KEY:
         st.success("Connected")
