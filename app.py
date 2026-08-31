@@ -1262,7 +1262,7 @@ def parse_duration_months(term_text, effective_date=None):
         return int(m.group(1))
     end_date = parse_date_flexible(term_text)
     if end_date is not None and effective_date is not None:
-        months = (end_date.year - effective_date.year) * 12 + (end_date.month - effective_date.month)
+        months = (end_date.year - effective_date.year) * 12 + (end_date.month - effective_date.month) + 1
         return max(months, 1)
     return None
 
@@ -1589,7 +1589,11 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     if effective_date is not None and int(effective_date.month) in actuals_by_month:
         ready_from = min(ready_from, int(effective_date.month))
 
-    year_months = sorted(set(m for m in active_months if m >= ready_from) | set(actuals_by_month))
+    year_months = [m for m in active_months if m >= ready_from]
+    if effective_date is not None:
+        start_m = int(effective_date.month)
+        if start_m in actuals_by_month and start_m not in year_months:
+            year_months = sorted(set(year_months + [start_m]))
     orig_2026_budget = flat_rate * len(year_months)
 
     cumulative_actual = sum(actuals_by_month.values())
