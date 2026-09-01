@@ -1,5 +1,6 @@
 """
-Contract Terms Extract — OpenAI-powered contract term extraction
+ContraXt — OpenAI-powered contract term extraction
+(HLB HAMT)
 
 Upload PDF contracts, define whatever fields you want extracted,
 and get a table (+ Excel export) with the extracted values per document.
@@ -94,65 +95,67 @@ def clear_persisted_state():
 st.set_page_config(page_title="ContraXt", page_icon="📄", layout="wide")
 
 # ---------------------------------------------------------------------------
-# Styling
+# Styling — dark TideLedger-inspired canvas
 # ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,600&family=Inter:wght@300;400;500;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,700;1,800&family=Inter:wght@400;500;600;700&display=swap');
 
-    :root {
-        --bg-page: #0b1420;
-        --bg-panel: #101c2c;
-        --bg-panel-2: #0e1826;
-        --border-soft: #1c2c40;
-        --accent: #38bdf8;
-        --accent-glow: rgba(56, 189, 248, 0.55);
-        --accent-soft: #7dd3fc;
-        --text-light: #eef4fb;
-        --text-muted: #8ca0b8;
+    html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
+        font-family: 'Inter', sans-serif;
+        color: #F4FBFF;
     }
-
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; font-weight: 300; }
-
-    [data-testid="stAppViewContainer"], [data-testid="stHeader"], .main, section.main {
-        background-color: var(--bg-page) !important;
+    .stApp {
+        background:
+            radial-gradient(1100px 420px at 12% -8%, rgba(46, 200, 222, 0.10), transparent 55%),
+            linear-gradient(180deg, #07161f 0%, #06141c 100%);
     }
-    [data-testid="stHeader"] { background-color: transparent !important; }
-    .block-container { padding-top: 2rem; }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stToolbar"] { background: transparent; }
+    [data-testid="stSidebar"] {
+        background: #0a1c26;
+        border-right: 1px solid rgba(94, 210, 230, 0.18);
+    }
+    [data-testid="stSidebar"] * { color: #E8F4F8; }
+    .stMarkdown, .stCaption, label, p, span, div { color: inherit; }
+    [data-testid="stCaption"] { color: #8AA3B0 !important; }
 
-    h1, h2, h3, h4, h5, h6, p, span, label, div { color: var(--text-light); }
-
-    .app-title {
-        font-family: 'Playfair Display', 'Georgia', serif;
+    .wordmark-wrap { text-align: center; margin: 0.2rem 0 1.4rem; }
+    .wordmark {
+        margin: 0;
+        font-family: "Playfair Display", "Times New Roman", serif;
         font-style: italic;
-        font-weight: 600;
-        font-size: 3rem;
-        color: var(--text-light);
-        text-align: center;
+        font-weight: 800;
+        font-size: clamp(42px, 6.4vw, 76px);
+        letter-spacing: 0.04em;
+        line-height: 1;
+        color: #F3FBFF;
+        -webkit-text-stroke: 1px #16323c;
         text-shadow:
-            0 0 6px var(--accent-glow),
-            0 0 18px var(--accent-glow),
-            0 0 36px rgba(56, 189, 248, 0.35);
-        margin-bottom: 0;
-        letter-spacing: 0.01em;
+            0 1px 0 #ffffff,
+            0 0 3px rgba(190, 255, 230, 0.9),
+            0 0 10px rgba(94, 228, 242, 0.55),
+            0 0 22px rgba(80, 255, 180, 0.28),
+            0 0 36px rgba(46, 200, 222, 0.22),
+            2px 3px 0 #0a2430;
     }
-    .app-subtitle {
-        color: var(--text-muted);
+    .wordmark-sub {
+        margin-top: 0.55rem;
+        color: #8AA3B0;
         font-size: 0.78rem;
-        font-weight: 300;
         letter-spacing: 0.18em;
         text-transform: uppercase;
-        text-align: center;
-        margin-top: 0.4rem;
-        margin-bottom: 1.8rem;
     }
+    .app-title { display: none; }
+    .app-subtitle { display: none; }
+
     .step-label {
         font-family: 'Inter', sans-serif;
-        font-weight: 500;
+        font-weight: 600;
         font-size: 1.05rem;
-        color: var(--text-light);
-        border-bottom: 1px solid var(--border-soft);
+        color: #F4FBFF;
+        border-bottom: 1px solid rgba(94, 210, 230, 0.22);
         padding-bottom: 0.4rem;
         margin-top: 1.6rem;
         margin-bottom: 0.9rem;
@@ -160,86 +163,79 @@ st.markdown(
     div[data-testid="stStatusWidget"] { display: none; }
     #MainMenu, footer { visibility: hidden; }
 
-    /* Cards / bordered containers */
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        background-color: var(--bg-panel);
-        border: 1px solid var(--border-soft) !important;
-        border-radius: 14px !important;
-    }
-
-    /* Buttons — pill shaped, glow when active/primary */
     div.stButton > button {
-        background-color: var(--bg-panel);
-        color: var(--text-muted);
-        border: 1px solid var(--border-soft);
-        border-radius: 999px;
-        font-weight: 400;
+        background: #0b2130 !important;
+        color: #F4FBFF !important;
+        border: 1px solid rgba(94, 228, 242, 0.35) !important;
+        border-radius: 999px !important;
+        box-shadow: 0 0 0 1px rgba(94, 228, 242, 0.16), 0 0 14px rgba(46, 200, 222, 0.12);
     }
     div.stButton > button:hover {
-        border: 1px solid var(--accent-soft);
-        color: var(--text-light);
+        border-color: #5EE4F2 !important;
+        box-shadow: 0 0 0 1px rgba(94, 228, 242, 0.45), 0 0 18px rgba(46, 200, 222, 0.28) !important;
     }
     div.stButton > button[kind="primary"] {
-        background-color: rgba(56, 189, 248, 0.12);
-        color: var(--text-light);
-        border: 1px solid var(--accent);
-        box-shadow: 0 0 16px var(--accent-glow);
+        background: #0b2834 !important;
+        color: #F4FBFF !important;
+        border: 1px solid #5EE4F2 !important;
+        box-shadow: 0 0 0 1px rgba(94, 228, 242, 0.45), 0 0 22px rgba(46, 200, 222, 0.38) !important;
     }
     div.stButton > button[kind="primary"]:hover {
-        background-color: rgba(56, 189, 248, 0.18);
-        box-shadow: 0 0 22px var(--accent-glow);
+        background: #10303c !important;
     }
     div.stButton > button:disabled {
-        opacity: 0.4;
-        box-shadow: none;
+        opacity: 0.42;
+        box-shadow: none !important;
+        border-color: rgba(138, 163, 176, 0.25) !important;
+        color: #8AA3B0 !important;
     }
 
-    /* Metrics */
-    div[data-testid="stMetric"] {
-        background-color: var(--bg-panel);
-        border: 1px solid var(--border-soft);
-        border-radius: 12px;
-        padding: 0.9rem 1rem;
+    [data-testid="stTextInput"] input,
+    [data-testid="stNumberInput"] input,
+    [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+    textarea {
+        background: #0a1c26 !important;
+        color: #F4FBFF !important;
+        border-color: rgba(94, 210, 230, 0.28) !important;
     }
-    div[data-testid="stMetricValue"] { color: var(--text-light); }
-    div[data-testid="stMetricLabel"] { color: var(--text-muted); }
-
-    /* Inputs */
-    div[data-baseweb="select"] > div, input, textarea {
-        background-color: var(--bg-panel-2) !important;
-        color: var(--text-light) !important;
-        border-color: var(--border-soft) !important;
+    [data-testid="stExpander"] {
+        background: #0c2230;
+        border: 1px solid rgba(94, 210, 230, 0.18);
+        border-radius: 14px;
     }
-
-    /* File uploader */
-    div[data-testid="stFileUploaderDropzone"] {
-        background-color: var(--bg-panel);
-        border: 1px dashed var(--border-soft);
-        border-radius: 12px;
+    [data-testid="stFileUploader"] {
+        background: #0c2230;
+        border: 1.5px dashed rgba(94, 228, 242, 0.28);
+        border-radius: 16px;
+        padding: 0.4rem;
     }
-
     table {
         width: 100%;
         border-collapse: collapse;
         font-size: 0.9rem;
+        color: #F4FBFF;
     }
     table th {
-        background-color: var(--bg-panel-2);
-        color: var(--accent-soft);
+        background-color: #0e2836;
+        color: #5EE4F2;
         text-align: left;
         padding: 0.5rem 0.7rem;
-        border-bottom: 2px solid var(--border-soft);
-        text-transform: uppercase;
-        font-size: 0.72rem;
-        letter-spacing: 0.04em;
+        border-bottom: 1px solid rgba(94, 210, 230, 0.28);
     }
     table td {
         padding: 0.5rem 0.7rem;
-        border-bottom: 1px solid var(--border-soft);
-        color: var(--text-light);
+        border-bottom: 1px solid rgba(94, 210, 230, 0.14);
+        color: #E8F4F8;
     }
     table tr:hover td {
-        background-color: rgba(56, 189, 248, 0.06);
+        background-color: rgba(94, 228, 242, 0.06);
+    }
+    .logo-chip {
+        display: inline-flex;
+        align-items: center;
+        background: #F4FBFF;
+        border-radius: 10px;
+        padding: 6px 10px;
     }
     </style>
     """,
@@ -375,16 +371,19 @@ def _load_logo():
         return None
 
 _logo = _load_logo()
-hdr_l, hdr_c, hdr_r = st.columns([1, 3, 1])
-with hdr_l:
+hdr_logo, hdr_mid, hdr_right = st.columns([1.2, 3.6, 1.2])
+with hdr_logo:
     if _logo is not None:
-        st.image(_logo, width=90)
-with hdr_c:
-    st.markdown('<div class="app-title">ContraXt</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="app-subtitle">AI Driven Extraction &amp; Forecasting</div>',
-        unsafe_allow_html=True,
-    )
+        st.image(_logo, use_container_width=True)
+st.markdown(
+    """
+    <div class="wordmark-wrap">
+      <p class="wordmark">ContraXt</p>
+      <div class="wordmark-sub">Contract terms extract · HLB HAMT</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if not OPENAI_API_KEY:
     st.error(
@@ -2363,7 +2362,7 @@ def render_variance_mode():
 # ---------------------------------------------------------------------------
 # Wizard navigation — each step must be confirmed before the next unlocks
 # ---------------------------------------------------------------------------
-STEP_NAMES = {1: "1. Contract Audit", 2: "2. Contract Classification", 3: "3. Actuals Upload", 4: "4. Forecasting", 5: "5. Variance & Cohort Tracking"}
+STEP_NAMES = {1: "1. Audit", 2: "2. Classify", 3: "3. Actuals", 4: "4. Forecast", 5: "5. Variance"}
 nav_cols = st.columns(5)
 for step_num, label in STEP_NAMES.items():
     with nav_cols[step_num - 1]:
