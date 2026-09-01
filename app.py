@@ -121,14 +121,33 @@ st.markdown(
     .stMarkdown, .stCaption, label, p, span, div { color: inherit; }
     [data-testid="stCaption"] { color: #8AA3B0 !important; }
 
-    .wordmark-wrap { text-align: center; margin: 0.2rem 0 1.4rem; }
+    .block-container { padding-top: 1.1rem !important; padding-bottom: 2rem !important; }
+    [data-testid="stSidebar"] img { max-height: 44px !important; width: auto !important; }
+    .cx-header {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        margin: 0 0 10px;
+    }
+    .cx-logo {
+        background: #F4FBFF;
+        border-radius: 8px;
+        padding: 5px 8px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        flex-shrink: 0;
+    }
+    .cx-logo img { height: 36px; width: auto; display: block; }
+    .wordmark-wrap { text-align: left; margin: 0; }
     .wordmark {
         margin: 0;
         font-family: "Playfair Display", "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        font-size: clamp(42px, 6.4vw, 76px);
-        letter-spacing: 0.04em;
+        font-size: 44px;
+        letter-spacing: 0.03em;
         line-height: 1;
         color: #F3FBFF;
         -webkit-text-stroke: 1px #16323c;
@@ -136,16 +155,15 @@ st.markdown(
             0 1px 0 #ffffff,
             0 0 3px rgba(190, 255, 230, 0.9),
             0 0 10px rgba(94, 228, 242, 0.55),
-            0 0 22px rgba(80, 255, 180, 0.28),
-            0 0 36px rgba(46, 200, 222, 0.22),
+            0 0 18px rgba(46, 200, 222, 0.25),
             2px 3px 0 #0a2430;
     }
     .wordmark-sub {
-        margin-top: 0.55rem;
+        margin-top: 5px;
         color: #8AA3B0;
         font-size: 0.78rem;
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        text-transform: none;
     }
     .app-title { display: none; }
     .app-subtitle { display: none; }
@@ -371,15 +389,14 @@ def _load_logo():
         return None
 
 _logo = _load_logo()
-hdr_logo, hdr_mid, hdr_right = st.columns([1.2, 3.6, 1.2])
-with hdr_logo:
-    if _logo is not None:
-        st.image(_logo, use_container_width=True)
 st.markdown(
-    """
-    <div class="wordmark-wrap">
-      <p class="wordmark">ContraXt</p>
-      <div class="wordmark-sub">Contract terms extract · HLB HAMT</div>
+    f"""
+    <div class="cx-header">
+      <div class="cx-logo"><img alt="HLB HAMT" src="data:image/png;base64,{_LOGO_B64}" /></div>
+      <div class="wordmark-wrap">
+        <p class="wordmark">ContraXt</p>
+        <div class="wordmark-sub">AI Driven Contractual Terms Extraction &amp; Forecasting</div>
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
