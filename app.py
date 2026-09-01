@@ -1637,8 +1637,13 @@ def render_actuals_upload_mode():
 
 
 def first_ready_month(effective_date, calendar_year):
-    """Plans are made on the 1st. A mid-month start (e.g. 15 Jan) is first
-    included when the planner stands on 1 Feb."""
+    """First calendar month the contract enters the 2026 (or chosen-year) envelope.
+
+    A mid-month start (e.g. 20 April) is NOT in the envelope yet — it is first
+    budgeted from the following month — unless an actual is later found in the
+    start month, which pulls that month in. Selecting April (= as-of 30 April)
+    with a 20 April start and no April actual means the contract is not live.
+    """
     if effective_date is None:
         return None
     if effective_date.day <= 1:
@@ -1653,11 +1658,22 @@ def first_ready_month(effective_date, calendar_year):
 
 
 def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx, budget_method="fixed"):
-    """Fixed (default): remaining 2026 months =
-    (original 2026 budget − YTD actuals) / months left in 2026.
+    """Fixed budgeting (selected month = close of that month, e.g. April → 30 Apr):
 
-    Flexible: remaining months =
-    (full contract value − YTD actuals) / (full term months − months with actuals).
+    Actual period  = January .. selected month (inclusive).
+    Forecast period = month after selected .. December.
+
+    Column B (annual envelope) = (contract value / term months) × count of
+    year-months the contract is live. A mid-month start is live from the next
+    month, or from the start month if an actual was posted there.
+
+    Monthly cells:
+      - Actual period: posted actual only (0 if none — never a budget plug).
+      - Forecast period: (column B − cumulative actuals through selected month)
+        / (12 − selected month number), applied only to months the contract
+        is live. No negatives.
+
+    Flexible: leftover full contract value spread over remaining term months.
     """
     empty = {
         "live": False, "cumulative_actual": 0.0, "actual_months": 0,
@@ -1669,13 +1685,6 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     if not active_months or flat_rate is None or contract_value is None or not duration_months:
         return None, None, [], {}, empty
 
-    planning_date = pd.Timestamp(year=calendar_year, month=through_month_idx, day=1)
-    if effective_date is not None and planning_date < pd.Timestamp(effective_date).normalize():
-        monthly_values = {m: 0.0 for m in range(1, 13)}
-        meta = dict(empty)
-        meta["reason"] = f"Not live on {planning_date.strftime('%d %b %Y')} — starts {pd.Timestamp(effective_date).strftime('%d %b %Y')}"
-        return 0.0, 0.0, [], monthly_values, meta
-
     ready_from = first_ready_month(effective_date, calendar_year) or 1
 
     actuals_by_month = {}
@@ -1685,23 +1694,50 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
             if val is not None:
                 actuals_by_month[m] = float(val)
 
-    # Mid-month starts (Nomad 15 Jan) stay out of that first month unless
-    # an actual was posted there (Meridian 42,000 in January).
-    if effective_date is not None and int(effective_date.month) in actuals_by_month:
+    # Mid-month start joins the envelope in its start month only when an
+    # actual was posted in that month in this calendar year.
+    if (
+        effective_date is not None
+        and effective_date.year == calendar_year
+        and int(effective_date.month) in actuals_by_month
+    ):
         ready_from = min(ready_from, int(effective_date.month))
 
     year_months = [m for m in active_months if m >= ready_from]
-    if effective_date is not None:
+    if effective_date is not None and effective_date.year == calendar_year:
         start_m = int(effective_date.month)
         if start_m in actuals_by_month and start_m not in year_months:
             year_months = sorted(set(year_months + [start_m]))
     orig_2026_budget = flat_rate * len(year_months)
 
-    cumulative_actual = sum(actuals_by_month.values())
-    actual_month_count = len(actuals_by_month)
-    future_months = [m for m in year_months if m > through_month_idx]
-
     monthly_values = {m: 0.0 for m in range(1, 13)}
+
+    # Close of selected month: contract is not in the book yet if its first
+    # budget month is still in the future and no start-month actual pulled it in.
+    if through_month_idx < ready_from:
+        start_label = (
+            pd.Timestamp(effective_date).strftime("%d %b %Y")
+            if effective_date is not None else "unknown start"
+        )
+        meta = dict(empty)
+        meta["orig_2026_budget"] = orig_2026_budget
+        meta["orig_monthly_rate"] = flat_rate
+        meta["ready_from"] = ready_from
+        meta["reason"] = (
+            f"Not in existence at the end of {MONTH_NAMES[through_month_idx - 1]} "
+            f"— starts {start_label} and has no actual in the start month. "
+            f"First budget month is {MONTH_NAMES[ready_from - 1]}."
+        )
+        return 0.0, 0.0, [], monthly_values, meta
+
+    actual_period = list(range(1, through_month_idx + 1))
+    forecast_period = list(range(through_month_idx + 1, 13))
+
+    # Cumulative spend is everything posted in the actual period, even if a
+    # posting falls outside the envelope months (so overspend is visible).
+    cumulative_actual = sum(actuals_by_month.get(m, 0.0) for m in actual_period)
+    actual_month_count = sum(1 for m in actual_period if m in actuals_by_month)
+    future_months = [m for m in year_months if m in forecast_period]
 
     insufficient = False
     leftover = 0.0
@@ -1714,10 +1750,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         else:
             new_monthly_rate = leftover / remaining_period
         for m in year_months:
-            if m < through_month_idx:
+            if m <= through_month_idx:
                 monthly_values[m] = max(actuals_by_month.get(m, 0.0), 0.0)
-            elif m == through_month_idx:
-                monthly_values[m] = max(actuals_by_month.get(m, new_monthly_rate), 0.0)
             else:
                 monthly_values[m] = new_monthly_rate
         display_total = sum(monthly_values.values())
@@ -1725,21 +1759,32 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         leftover = orig_2026_budget - cumulative_actual
         if leftover < 0:
             insufficient = True
-        if actual_month_count == 0:
-            remaining_period = len(year_months) or 1
-            new_monthly_rate = flat_rate
+
+        # Denominator is (12 − selected month) = length of the forecast period.
+        # Amounts are written only onto forecast months the contract is live.
+        remaining_period = len(forecast_period)
+        if remaining_period <= 0:
+            new_monthly_rate = 0.0
+        elif leftover <= 0:
+            new_monthly_rate = 0.0
+        else:
+            new_monthly_rate = leftover / remaining_period
+
+        if not actuals_lookup:
+            # No actuals file: keep the original flat monthly envelope.
             for m in year_months:
                 monthly_values[m] = flat_rate
+            remaining_period = len(year_months)
+            new_monthly_rate = flat_rate
         else:
-            remaining_period = max(len(future_months), 1)
-            new_monthly_rate = leftover / remaining_period if leftover > 0 else 0.0
-            for m in year_months:
+            for m in range(1, 13):
                 if m <= through_month_idx:
                     monthly_values[m] = max(actuals_by_month.get(m, 0.0), 0.0)
-                else:
+                elif m in year_months:
                     monthly_values[m] = new_monthly_rate
-            if through_month_idx in year_months and through_month_idx not in actuals_by_month and leftover > 0:
-                monthly_values[through_month_idx] = new_monthly_rate
+                else:
+                    monthly_values[m] = 0.0
+
         display_total = orig_2026_budget
 
     meta = {
@@ -1754,6 +1799,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "insufficient": insufficient,
         "leftover": leftover,
         "reason": "",
+        "actual_period_end": through_month_idx,
+        "forecast_months": remaining_period,
     }
     return display_total, new_monthly_rate, year_months, monthly_values, meta
 
@@ -1851,15 +1898,15 @@ def render_forecast_mode():
             horizontal=True,
             key="budget_method",
             format_func=lambda x: "Fixed budgeting (2026 envelope)" if x == "fixed" else "Flexible budgeting (full contract term)",
-            help="Fixed: leftover 2026 budget is spread over months left in 2026. Flexible: leftover full contract value is spread over months left on the contract.",
+            help="Fixed: Column B is the locked year envelope. Actual period (Jan–selected month) takes posted actuals only; leftover envelope is spread across the forecast period (next month–Dec) as (B − YTD actuals) / (12 − selected month). Flexible: leftover full contract value is spread over months left on the contract.",
         )
         mc1, mc2 = st.columns([3, 1])
         through_month = mc1.selectbox(
-            "Actuals known through month",
+            "Close of month (actuals through)",
             MONTH_NAMES,
             index=0,
             key="forecast_through_month",
-            help="Months up to this one use posted actuals. Later months use the selected budgeting method.",
+            help="Treats the choice as month-end (April = 30 April). Actual period = January through this month — cells come from the actuals file only. Forecast period = the following month through December.",
         )
         through_month_idx = MONTH_NAMES.index(through_month) + 1
         mc2.write("")  # vertical spacer to align button with selectbox
@@ -2086,7 +2133,7 @@ def render_forecast_mode():
                 if not rf_meta.get("live", True):
                     st.info(
                         rf_meta.get("reason")
-                        or "Not live on the 1st of the chosen month — no budget line this period."
+                        or "Not in existence at the end of the chosen month — no budget line this period."
                     )
                     continue
 
@@ -2127,12 +2174,23 @@ def render_forecast_mode():
                         f"{'2026 budget ' + format(orig_2026, ',.0f') if method == 'fixed' else 'contract value ' + format(value or 0, ',.0f')}. "
                         f"Overspent by {over:,.2f}. Remaining months are set to 0 — no negative figures."
                     )
-                if recorded is not None and method == "fixed":
-                    st.caption(
-                        f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
-                        f"Fixed rate = ({orig_2026:,.0f} − {cum:,.0f}) / {rem} remaining 2026 months "
-                        f"= {monthly_rate_calc:,.2f}/month."
-                    )
+                if method == "fixed":
+                    act_end = MONTH_NAMES[through_month_idx - 1]
+                    if rem <= 0:
+                        st.caption(
+                            f"Actual period Jan–{act_end}. No forecast period left. "
+                            f"Column B stays {orig_2026:,.0f}. YTD actuals {cum:,.0f}."
+                        )
+                    else:
+                        st.caption(
+                            f"Actual period Jan–{act_end} (posted actuals only). "
+                            f"Forecast period {MONTH_NAMES[through_month_idx]}–Dec "
+                            f"({rem} month{'s' if rem != 1 else ''}). "
+                            f"Column B = {orig_2026:,.0f}. "
+                            f"Forecast rate = ({orig_2026:,.0f} − {cum:,.0f}) / {rem} "
+                            f"= {monthly_rate_calc:,.2f}/month."
+                            + (f" {act_end} actual = {recorded:,.2f}." if recorded is not None else f" No {act_end} actual posted.")
+                        )
                 elif recorded is not None:
                     st.caption(
                         f"{MONTH_NAMES[through_month_idx-1]} actual = {recorded:,.2f}. "
