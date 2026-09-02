@@ -2969,11 +2969,26 @@ def render_variance_mode():
                     run_a += c["actual_by_month"][m]
                     cum_plan.append(run_p)
                     cum_act.append(run_a)
-                chart_df = pd.DataFrame(
-                    {"Cumulative plan": cum_plan, "Cumulative actual": cum_act},
-                    index=MONTH_NAMES[:through_idx],
+                import altair as alt
+                chart_df = pd.DataFrame({
+                    "MonthNum": list(range(1, through_idx + 1)) * 2,
+                    "Month": MONTH_NAMES[:through_idx] * 2,
+                    "Series": ["Cumulative plan"] * through_idx + ["Cumulative actual"] * through_idx,
+                    "Amount": cum_plan + cum_act,
+                })
+                month_label_expr = "[" + ",".join(f"'{m}'" for m in MONTH_NAMES) + "][datum.value - 1]"
+                chart = (
+                    alt.Chart(chart_df)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("MonthNum:O", title=None, axis=alt.Axis(labelExpr=month_label_expr, labelAngle=0)),
+                        y=alt.Y("Amount:Q", title=None, axis=alt.Axis(format=",.0f")),
+                        color=alt.Color("Series:N", title=None),
+                        tooltip=["Month", "Series", alt.Tooltip("Amount:Q", format=",.0f")],
+                    )
+                    .properties(height=260)
                 )
-                st.line_chart(chart_df)
+                st.altair_chart(chart, use_container_width=True)
 
     # ---------------- At-risk lines + proposals ----------------
     st.markdown('<div class="step-label">Lines at risk of overspending</div>', unsafe_allow_html=True)
