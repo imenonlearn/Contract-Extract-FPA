@@ -1631,11 +1631,12 @@ def parse_amount(value_text, duration_months=None):
 
 
 def first_validity_month(effective_date, calendar_year, actuals_by_month):
-    """First 2026 month that counts toward Column B.
+    """First calendar month that counts toward Column B.
 
-    Starts in the effective-date month (March for Pulse). The month before
-    that is pulled in only when an actual was posted there (February actual
-    on a March start). Otherwise the envelope starts in the start month.
+    The start month is included only when an actual was posted in that month.
+    Otherwise the envelope starts the following month (Nomad 15 Jan, no Jan
+    actual → Feb–Dec = 11 months). A month before start is included only
+    when that prior month itself has an actual.
     """
     if effective_date is None:
         return 1
@@ -1647,7 +1648,9 @@ def first_validity_month(effective_date, calendar_year, actuals_by_month):
     prior = start_m - 1
     if prior >= 1 and actuals_by_month and prior in actuals_by_month:
         return prior
-    return start_m
+    if actuals_by_month and start_m in actuals_by_month:
+        return start_m
+    return start_m + 1 if start_m < 12 else 13
 
 
 def contract_end_date(effective_date, duration_months):
@@ -1998,6 +2001,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     )
     if ready_from < start_m:
         periods += start_m - ready_from
+    elif ready_from > start_m and effective_date is not None and effective_date.year == calendar_year:
+        periods = max(periods - (ready_from - start_m), 0)
     year_months = [m for m in range(ready_from, min(12, expiry_cap) + 1)]
     orig_2026_budget = flat_rate * max(periods, 0)
     validity_start_label = MONTH_NAMES[ready_from - 1] if 1 <= ready_from <= 12 else "?"
@@ -2493,7 +2498,7 @@ def render_forecast_mode():
 - **Monthly rate** = contract figure ÷ term months  
   `{value_num:,.0f} ÷ {dur_n or "?"} = {monthly_orig:,.2f}`  
 - **{year} validity:** {v_start}–{v_end} = **{per_n or "?"} month(s)**  
-  (start month is included; the month before start is included only if that month has an actual)  
+  (start month is included only if it has an actual; otherwise it is excluded)  
 - **Column B envelope** = monthly rate × {year} validity months  
   `{monthly_orig:,.2f} × {per_n or "?"} = {orig_2026:,.2f}`
                         """.strip()
