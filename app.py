@@ -1349,18 +1349,49 @@ def parse_date_flexible(text):
         return None
 
 
+_WORD_NUMBERS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "eighteen": 18, "twenty": 20, "twentyfour": 24, "twenty-four": 24,
+    "thirty": 30, "thirtysix": 36, "thirty-six": 36,
+}
+
+
+def _number_from_token(token: str):
+    token = (token or "").strip().lower()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    if token in _WORD_NUMBERS:
+        return _WORD_NUMBERS[token]
+    return None
+
+
 def parse_duration_months(term_text, effective_date=None):
     if not term_text or str(term_text).strip().lower() == "not found":
         return None
     text = str(term_text).lower()
-    # \D{0,3} tolerates a closing paren/space between the digit and the unit word,
-    # e.g. "two (2) years" — the digit isn't immediately followed by "year".
-    m = re.search(r"(\d+)\D{0,3}year", text)
-    if m:
-        return int(m.group(1)) * 12
-    m = re.search(r"(\d+)\D{0,3}month", text)
-    if m:
-        return int(m.group(1))
+
+    # Digits or words: "6 months", "six months", "two (2) years", "12-month term".
+    patterns = [
+        (r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+         r"thirteen|fourteen|fifteen|sixteen|eighteen|twenty|thirty|"
+         r"twenty-four|thirty-six|a|an|\d+)\s*(?:\([^)]{0,12}\)\s*)?"
+         r"[- ]*(year|yr)s?\b", 12),
+        (r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+         r"thirteen|fourteen|fifteen|sixteen|eighteen|twenty|thirty|"
+         r"twenty-four|thirty-six|a|an|\d+)\s*(?:\([^)]{0,12}\)\s*)?"
+         r"[- ]*(month|mo)s?\b", 1),
+    ]
+    for pattern, multiplier in patterns:
+        m = re.search(pattern, text)
+        if m:
+            n = _number_from_token(m.group(1))
+            if n:
+                return n * multiplier
+
     end_date = parse_date_flexible(term_text)
     if end_date is not None and effective_date is not None:
         months = (end_date.year - effective_date.year) * 12 + (end_date.month - effective_date.month) + 1
@@ -1663,9 +1694,10 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     Actual period  = January .. selected month (inclusive).
     Forecast period = month after selected .. December.
 
-    Column B (annual envelope) = (contract value / term months) × count of
-    year-months the contract is live. A mid-month start is live from the next
-    month, or from the start month if an actual was posted there.
+    Column B (annual envelope) = monthly rate × every contract month that
+    falls in the calendar year (a January–June 6-month term → 6 × monthly).
+    A mid-month start is hidden only when the selected month is still that
+    start month and no actual has been posted yet.
 
     Monthly cells:
       - Actual period: posted actual only (0 if none — never a budget plug).
@@ -1703,11 +1735,9 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     ):
         ready_from = min(ready_from, int(effective_date.month))
 
-    year_months = [m for m in active_months if m >= ready_from]
-    if effective_date is not None and effective_date.year == calendar_year:
-        start_m = int(effective_date.month)
-        if start_m in actuals_by_month and start_m not in year_months:
-            year_months = sorted(set(year_months + [start_m]))
+    # Envelope counts every contract month in the calendar year, including a
+    # partial start month (6 months × 42,000 = 252,000 for Meridian).
+    year_months = list(active_months)
     orig_2026_budget = flat_rate * len(year_months)
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
@@ -1976,15 +2006,18 @@ def render_forecast_mode():
             })
             continue
 
-        eff_date = parse_date_flexible(row.get("Effective Date"))
-        duration = parse_duration_months(row.get("Term / Expiry"), eff_date)
-        value = parse_amount(row.get("Contract Value"), duration)
-        raw_debug = {
-            "Effective Date (raw)": row.get("Effective Date"),
-            "Term / Expiry (raw)": row.get("Term / Expiry"),
-            "Contract Value (raw)": row.get("Contract Value"),
-        }
         row_idx = file_rows.index[0]
+        eff_text = st.session_state.get(f"override_{row_idx}_Effective Date", row.get("Effective Date"))
+        term_text = st.session_state.get(f"override_{row_idx}_Term / Expiry", row.get("Term / Expiry"))
+        value_text = st.session_state.get(f"override_{row_idx}_Contract Value", row.get("Contract Value"))
+        eff_date = parse_date_flexible(eff_text)
+        duration = parse_duration_months(term_text, eff_date)
+        value = parse_amount(value_text, duration)
+        raw_debug = {
+            "Effective Date (raw)": eff_text,
+            "Term / Expiry (raw)": term_text,
+            "Contract Value (raw)": value_text,
+        }
 
         # Ask the model to suggest where this fits among the sheet's real headings.
         suggested_heading, suggested_subheading = None, ""
@@ -2081,6 +2114,15 @@ def render_forecast_mode():
                             st.session_state[f"override_{row_idx}_Term / Expiry"] = entered.strip()
                         else:
                             st.caption("Couldn't read a duration from that — try '12 months' or '2 years'.")
+
+                # Recurring fees ("AED 42,000 per month") must be scaled by the
+                # term. Re-parse after duration is known so a late term fix
+                # cannot leave the monthly figure as if it were the total.
+                raw_value_text = (item.get("raw_debug") or {}).get("Contract Value (raw)")
+                if duration and raw_value_text:
+                    restated = parse_amount(raw_value_text, duration)
+                    if restated is not None:
+                        value = restated
 
                 if value is None:
                     entered = st.number_input(
