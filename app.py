@@ -1169,21 +1169,46 @@ def _flatten_columns(df):
 
 
 def _month_number_from_label(label):
-    raw = str(label).strip().lower()
-    if raw.startswith("unnamed"):
+    if label is None or (isinstance(label, float) and pd.isna(label)):
         return None
-    text = re.sub(r"[^a-z0-9]", "", raw)
-    if not text:
+    if isinstance(label, (pd.Timestamp,)):
+        return int(label.month)
+    try:
+        import datetime as _dt
+        if isinstance(label, _dt.datetime):
+            return int(label.month)
+    except Exception:
+        pass
+
+    raw = str(label).strip()
+    raw_l = raw.lower()
+    if raw_l.startswith("unnamed") or raw_l in ("nan", "none", ""):
+        return None
+
+    # Excel month headers often arrive as "2026-06-01 00:00:00"
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.notna(parsed) and re.search(r"\d{4}|\d{1,2}\s*[-/]\s*\d", raw):
+        return int(parsed.month)
+
+    compact = re.sub(r"[^a-z0-9]", "", raw_l)
+    if not compact:
         return None
     full = [
         "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
     ]
-    for i, name in enumerate(full, start=1):
-        if text == name or text == name[:3] or text.startswith(name):
+    short = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    for i, (name, abbr) in enumerate(zip(full, short), start=1):
+        if compact == name or compact == abbr:
             return i
-        if re.search(rf"\b{name[:3]}\b", raw) or re.search(rf"\b{name}\b", raw):
+        if compact.startswith(name) or compact.startswith(abbr):
+            rest = compact[len(name):] if compact.startswith(name) else compact[len(abbr):]
+            if rest == "" or rest.isdigit():
+                return i
+        if re.search(rf"\b{abbr}\b", raw_l) or re.search(rf"\b{name}\b", raw_l):
             return i
+    if compact.isdigit() and 1 <= int(compact) <= 12:
+        return int(compact)
     return None
 
 
@@ -1218,7 +1243,9 @@ def build_monthly_actuals_lookup(df_dump, date_col, name_col, amount_col, year):
 
     if date_col in df.columns and amount_col in df.columns:
         dated = df.copy()
-        dated["_date"] = pd.to_datetime(dated[date_col], errors="coerce")
+        dated["_date"] = pd.to_datetime(dated[date_col], errors="coerce", dayfirst=True)
+        if dated["_date"].isna().mean() > 0.5:
+            dated["_date"] = pd.to_datetime(dated[date_col], errors="coerce", dayfirst=False)
         usable = dated[dated["_date"].notna()]
         if year:
             year_filtered = usable[usable["_date"].dt.year == year]
@@ -2365,6 +2392,24 @@ def render_forecast_mode():
                     columns=["Line Item", "Budget"] + MONTH_NAMES,
                 )
                 st.markdown(preview_df.to_html(index=False, escape=False, na_rep="0"), unsafe_allow_html=True)
+                if actuals_lookup:
+                    found = []
+                    for m in range(1, 13):
+                        hit = lookup_actual_amount(actuals_lookup, name_candidates, m)
+                        if hit is not None:
+                            found.append(f"{MONTH_NAMES[m-1]} {hit:,.0f}")
+                    if found:
+                        st.caption("Actuals matched to this vendor: " + " · ".join(found))
+                    else:
+                        st.caption("No actuals rows matched this vendor name. Check Account Name in Step 3 / the dropdown above.")
+                    sel_hit = lookup_actual_amount(actuals_lookup, name_candidates, through_month_idx)
+                    if sel_hit is None:
+                        st.warning(
+                            f"No {MONTH_NAMES[through_month_idx-1]} actual matched for "
+                            f"**{item['counterparty']}**. That month is stored as 0. "
+                            f"If the figure sits under a different account name, pick it in "
+                            f"**Account Name (from Actuals Upload)**."
+                        )
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
     if st.button("Apply to workbook", type="primary", disabled=not plan_by_sheet):
