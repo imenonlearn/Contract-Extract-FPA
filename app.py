@@ -1426,27 +1426,67 @@ def parse_amount(value_text, duration_months=None):
     return amount
 
 
+def contract_end_date(effective_date, duration_months):
+    """Inclusive end date: start 21 Jan + 6 months → 20 Jul."""
+    if effective_date is None or not duration_months:
+        return None
+    return pd.Timestamp(effective_date) + pd.DateOffset(months=int(duration_months)) - pd.Timedelta(days=1)
+
+
+def expiry_month_cap(effective_date, duration_months, calendar_year):
+    """Month number used as the forecast-period cap: min(12, expiry month)
+    when the contract ends in this year, otherwise 12 if it runs past December."""
+    end = contract_end_date(effective_date, duration_months)
+    if end is None:
+        return 12
+    if end.year > calendar_year:
+        return 12
+    if end.year < calendar_year:
+        return 0
+    return int(end.month)
+
+
+def payment_periods_in_year(effective_date, duration_months, calendar_year):
+    """How many contractual payment months begin in this calendar year."""
+    if effective_date is None or not duration_months:
+        return 0
+    start = pd.Timestamp(effective_date)
+    n = 0
+    for i in range(int(duration_months)):
+        if (start + pd.DateOffset(months=i)).year == calendar_year:
+            n += 1
+    return n
+
+
+def calendar_months_spanned(effective_date, duration_months, calendar_year):
+    """Every calendar month the contract touches in this year, including a
+    tail month (Jan 21–Jul 20 spans January through July)."""
+    end = contract_end_date(effective_date, duration_months)
+    if effective_date is None or end is None:
+        return []
+    months = []
+    cursor = pd.Timestamp(year=effective_date.year, month=effective_date.month, day=1)
+    last = pd.Timestamp(year=end.year, month=end.month, day=1)
+    while cursor <= last:
+        if cursor.year == calendar_year:
+            months.append(int(cursor.month))
+        cursor += pd.DateOffset(months=1)
+    return months
+
+
 def compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year):
-    """Returns (total_for_year, monthly_rate, [active_month_numbers]) or (None, None, []) if unparseable."""
+    """Returns (total_for_year, monthly_rate, [calendar months spanned]) or (None, None, []).
+
+    Column B uses contractual payment months in the year (6 × monthly), not the
+    extra tail calendar month a mid-month end may spill into.
+    """
     if contract_value is None or effective_date is None or not duration_months:
         return None, None, []
     monthly_rate = contract_value / duration_months
-    year_start = pd.Timestamp(year=calendar_year, month=1, day=1)
-    year_end = pd.Timestamp(year=calendar_year, month=12, day=31)
-
-    # Walk the contract's own calendar months from its start — capped at exactly
-    # duration_months entries, since a contract stated as "N months" should
-    # produce exactly N monthly periods, even if its exact end date spills a
-    # few days into what would otherwise look like an (N+1)th month.
-    all_contract_months = []
-    cursor = pd.Timestamp(year=effective_date.year, month=effective_date.month, day=1)
-    for _ in range(duration_months):
-        all_contract_months.append((cursor.year, cursor.month))
-        cursor += pd.DateOffset(months=1)
-
-    months_active = [m for (y, m) in all_contract_months if y == calendar_year]
-    total = monthly_rate * len(months_active)
-    return total, monthly_rate, months_active
+    periods = payment_periods_in_year(effective_date, duration_months, calendar_year)
+    months_spanned = calendar_months_spanned(effective_date, duration_months, calendar_year)
+    total = monthly_rate * periods
+    return total, monthly_rate, months_spanned
 
 
 def build_placement_prompt(contract_text: str, headings: list) -> str:
@@ -1689,21 +1729,19 @@ def first_ready_month(effective_date, calendar_year):
 
 
 def compute_reforecast(contract_value, effective_date, duration_months, calendar_year, actuals_lookup, name_candidates, through_month_idx, budget_method="fixed"):
-    """Fixed budgeting (selected month = close of that month, e.g. April → 30 Apr):
+    """Fixed budgeting (selected month = close of that month, e.g. May → 31 May):
 
-    Actual period  = January .. selected month (inclusive).
-    Forecast period = month after selected .. December.
+    Actual period   = January .. selected month (inclusive) — posted actuals only.
+    Forecast period = month after selected .. min(December, contract expiry month).
 
-    Column B (annual envelope) = monthly rate × every contract month that
-    falls in the calendar year (a January–June 6-month term → 6 × monthly).
-    A mid-month start is hidden only when the selected month is still that
-    start month and no actual has been posted yet.
+    Column B = monthly rate × contractual payment months that begin in the year
+    (Jan 21–Jul 20, 6 months × 42,000 = 252,000), even if January has no actual.
 
-    Monthly cells:
-      - Actual period: posted actual only (0 if none — never a budget plug).
-      - Forecast period: (column B − cumulative actuals through selected month)
-        / (12 − selected month number), applied only to months the contract
-        is live. No negatives.
+    Forecast monthly rate =
+        (Column B − cumulative actuals through selected month)
+        / (min(12, expiry_month) − selected_month).
+
+    Months after expiry are always 0. No negatives.
 
     Flexible: leftover full contract value spread over remaining term months.
     """
@@ -1713,8 +1751,10 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "method": budget_method,
     }
 
-    _, flat_rate, active_months = compute_prorated_budget(contract_value, effective_date, duration_months, calendar_year)
-    if not active_months or flat_rate is None or contract_value is None or not duration_months:
+    year_total, flat_rate, spanned_months = compute_prorated_budget(
+        contract_value, effective_date, duration_months, calendar_year
+    )
+    if not spanned_months or flat_rate is None or contract_value is None or not duration_months:
         return None, None, [], {}, empty
 
     ready_from = first_ready_month(effective_date, calendar_year) or 1
@@ -1726,8 +1766,7 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
             if val is not None:
                 actuals_by_month[m] = float(val)
 
-    # Mid-month start joins the envelope in its start month only when an
-    # actual was posted in that month in this calendar year.
+    # Mid-month start is visible from that month only when an actual posted.
     if (
         effective_date is not None
         and effective_date.year == calendar_year
@@ -1735,10 +1774,13 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     ):
         ready_from = min(ready_from, int(effective_date.month))
 
-    # Envelope counts every contract month in the calendar year, including a
-    # partial start month (6 months × 42,000 = 252,000 for Meridian).
-    year_months = list(active_months)
-    orig_2026_budget = flat_rate * len(year_months)
+    # Column B = payment periods in the year × monthly rate (6 × 42,000),
+    # not the extra tail calendar month the end date may spill into.
+    year_months = list(spanned_months)
+    orig_2026_budget = year_total if year_total is not None else flat_rate * payment_periods_in_year(
+        effective_date, duration_months, calendar_year
+    )
+    expiry_cap = expiry_month_cap(effective_date, duration_months, calendar_year)
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
 
@@ -1761,7 +1803,9 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         return 0.0, 0.0, [], monthly_values, meta
 
     actual_period = list(range(1, through_month_idx + 1))
-    forecast_period = list(range(through_month_idx + 1, 13))
+    # Forecast runs only to the contract's expiry month (or December if later).
+    forecast_end = max(min(12, expiry_cap), through_month_idx)
+    forecast_period = list(range(through_month_idx + 1, forecast_end + 1)) if expiry_cap > through_month_idx else []
 
     # Cumulative spend is everything posted in the actual period, even if a
     # posting falls outside the envelope months (so overspend is visible).
@@ -1790,9 +1834,9 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         if leftover < 0:
             insufficient = True
 
-        # Denominator is (12 − selected month) = length of the forecast period.
-        # Amounts are written only onto forecast months the contract is live.
-        remaining_period = len(forecast_period)
+        # (min(12, expiry month) − selected month). Example: expiry July,
+        # select May → min(12, 7) − 5 = 2 (June and July).
+        remaining_period = max(min(12, expiry_cap) - through_month_idx, 0)
         if remaining_period <= 0:
             new_monthly_rate = 0.0
         elif leftover <= 0:
@@ -1801,7 +1845,6 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
             new_monthly_rate = leftover / remaining_period
 
         if not actuals_lookup:
-            # No actuals file: keep the original flat monthly envelope.
             for m in year_months:
                 monthly_values[m] = flat_rate
             remaining_period = len(year_months)
@@ -1810,7 +1853,7 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
             for m in range(1, 13):
                 if m <= through_month_idx:
                     monthly_values[m] = max(actuals_by_month.get(m, 0.0), 0.0)
-                elif m in year_months:
+                elif m in forecast_period and m <= expiry_cap:
                     monthly_values[m] = new_monthly_rate
                 else:
                     monthly_values[m] = 0.0
@@ -1831,6 +1874,7 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "reason": "",
         "actual_period_end": through_month_idx,
         "forecast_months": remaining_period,
+        "expiry_month": expiry_cap,
     }
     return display_total, new_monthly_rate, year_months, monthly_values, meta
 
@@ -2218,19 +2262,26 @@ def render_forecast_mode():
                     )
                 if method == "fixed":
                     act_end = MONTH_NAMES[through_month_idx - 1]
+                    expiry_m = int(rf_meta.get("expiry_month") or 12)
+                    expiry_label = MONTH_NAMES[expiry_m - 1] if 1 <= expiry_m <= 12 else "Dec"
                     if rem <= 0:
                         st.caption(
-                            f"Actual period Jan–{act_end}. No forecast period left. "
-                            f"Column B stays {orig_2026:,.0f}. YTD actuals {cum:,.0f}."
+                            f"Actual period Jan–{act_end}. No forecast period left "
+                            f"(contract expires {expiry_label}). "
+                            f"Column B stays {orig_2026:,.0f}. YTD actuals {cum:,.0f}. "
+                            f"Months after expiry are 0."
                         )
                     else:
+                        fc_start = MONTH_NAMES[through_month_idx]
                         st.caption(
                             f"Actual period Jan–{act_end} (posted actuals only). "
-                            f"Forecast period {MONTH_NAMES[through_month_idx]}–Dec "
-                            f"({rem} month{'s' if rem != 1 else ''}). "
+                            f"Forecast period {fc_start}–{expiry_label} "
+                            f"({rem} month{'s' if rem != 1 else ''}; "
+                            f"min(12, expiry {expiry_m}) − {through_month_idx}). "
                             f"Column B = {orig_2026:,.0f}. "
                             f"Forecast rate = ({orig_2026:,.0f} − {cum:,.0f}) / {rem} "
-                            f"= {monthly_rate_calc:,.2f}/month."
+                            f"= {monthly_rate_calc:,.2f}/month. "
+                            f"Months after {expiry_label} are 0."
                             + (f" {act_end} actual = {recorded:,.2f}." if recorded is not None else f" No {act_end} actual posted.")
                         )
                 elif recorded is not None:
