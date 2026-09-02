@@ -1137,6 +1137,163 @@ def guess_column(columns, keywords):
     return None
 
 
+def _looks_like_header_label(value) -> bool:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    text = str(value).strip()
+    if not text or text.lower() in ("nan", "none"):
+        return False
+    lower = text.lower()
+    if re.search(r"(date|amount|account|vendor|supplier|name|item|desc|value|cost|spend|debit)", lower):
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z /_&-]{2,40}", text) and not re.search(r"llc|fz-|fze", lower):
+        return True
+    return False
+
+
+def _header_row_score(values) -> int:
+    labels = [v for v in values]
+    score = 0
+    headerish = 0
+    for v in labels:
+        if _looks_like_header_label(v):
+            headerish += 1
+            score += 3
+        text = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+        lower = text.lower()
+        if any(k in lower for k in ("date", "posted", "amount", "account name", "vendor", "supplier")):
+            score += 6
+        parsed = pd.to_datetime(text, errors="coerce")
+        if pd.notna(parsed) and re.search(r"\d{4}", text):
+            score -= 8
+        if re.fullmatch(r"-?\d+(\.\d+)?", text.replace(",", "")):
+            score -= 4
+        if re.search(r"\b(llc|fz-llc|fze|limited)\b", lower):
+            score -= 6
+    if headerish >= 3:
+        score += 8
+    return score
+
+
+def _series_date_hits(series) -> int:
+    hits = 0
+    for v in series.dropna().head(40):
+        parsed = pd.to_datetime(v, errors="coerce", dayfirst=True)
+        if pd.isna(parsed):
+            parsed = pd.to_datetime(v, errors="coerce")
+        if pd.notna(parsed) and 2018 <= getattr(parsed, "year", 0) <= 2040:
+            hits += 1
+    return hits
+
+
+def _series_amount_score(series) -> float:
+    nums = pd.to_numeric(series, errors="coerce").dropna()
+    if len(nums) < 2:
+        return -1
+    # Account codes often repeat; amounts vary and are not all 4–6 digit IDs.
+    unique_ratio = nums.nunique() / max(len(nums), 1)
+    mean_abs = float(nums.abs().mean())
+    if unique_ratio < 0.25 and mean_abs > 1000:
+        return unique_ratio
+    return unique_ratio * (1 + min(mean_abs / 10000.0, 5))
+
+
+def _series_account_score(series) -> float:
+    texts = series.dropna().astype(str).str.strip()
+    texts = texts[~texts.str.lower().isin(["nan", "none", ""])]
+    if texts.empty:
+        return -1
+    score = 0.0
+    llc_hits = texts.str.contains(r"llc|fz|limited|consult", case=False, regex=True).mean()
+    score += llc_hits * 5
+    score += min(texts.nunique() / max(len(texts), 1), 1) * 2
+    return score
+
+
+def infer_actuals_columns(df):
+    """Pick date / amount / account / line-item columns from cell values when
+    headers were actually a data row (dates, vendor names, amounts as titles)."""
+    date_col = amount_col = account_col = item_col = None
+    best_dates, best_amt, best_acct = -1, -1, -1
+    for col in df.columns:
+        d_hits = _series_date_hits(df[col])
+        if d_hits > best_dates:
+            best_dates, date_col = d_hits, col
+        a_score = _series_amount_score(df[col])
+        if a_score > best_amt:
+            best_amt, amount_col = a_score, col
+        ac_score = _series_account_score(df[col])
+        if ac_score > best_acct:
+            best_acct, account_col = ac_score, col
+    # Don't let the date column also win amount/account.
+    for col in df.columns:
+        if col in (date_col, amount_col, account_col):
+            continue
+        if guess_column([col], ["item", "desc", "vendor", "particular", "narration", "details"]):
+            item_col = col
+            break
+    if item_col is None:
+        for col in df.columns:
+            if col not in (date_col, amount_col, account_col):
+                if df[col].dtype == object:
+                    item_col = col
+                    break
+    if best_dates < 2:
+        date_col = None
+    if best_amt <= 0:
+        amount_col = None
+    if best_acct < 1:
+        account_col = None
+    return date_col, amount_col, account_col, item_col
+
+
+def load_actuals_table(dump_file, sheet_name=None):
+    """Read CSV/Excel, find the real header row, fall back to generic names + inference."""
+    if hasattr(dump_file, "seek"):
+        dump_file.seek(0)
+    if dump_file.name.lower().endswith(".csv"):
+        raw = pd.read_csv(dump_file, header=None)
+        return _frame_from_raw(raw), None
+
+    xls = pd.ExcelFile(dump_file, engine="openpyxl")
+    if sheet_name is None:
+        sheet_name = xls.sheet_names[0]
+    raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+    return _frame_from_raw(raw), sheet_name
+
+
+def _frame_from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    best_i, best_score = 0, -10**9
+    scan = min(12, len(raw))
+    for i in range(scan):
+        score = _header_row_score(list(raw.iloc[i].values))
+        if score > best_score:
+            best_score, best_i = score, i
+    if best_score >= 8:
+        columns = []
+        seen = {}
+        for i, v in enumerate(raw.iloc[best_i].tolist()):
+            label = str(v).strip() if pd.notna(v) else f"Column {i+1}"
+            if label.lower() in ("nan", "none", ""):
+                label = f"Column {i+1}"
+            if label in seen:
+                seen[label] += 1
+                label = f"{label} ({seen[label]})"
+            else:
+                seen[label] = 1
+            columns.append(label)
+        df = raw.iloc[best_i + 1 :].copy()
+        df.columns = columns
+    else:
+        df = raw.copy()
+        df.columns = [f"Column {i+1}" for i in range(df.shape[1])]
+    df = df.reset_index(drop=True)
+    df = df.dropna(how="all")
+    return _flatten_columns(df)
+
+
 _LEGAL_NAME_TOKENS = {
     "llc", "l", "fz", "fzc", "fzco", "fze", "ltd", "limited", "co", "company",
     "pjsc", "psc", "inc", "corp", "corporation", "llp", "plc", "sa", "sarl",
@@ -1703,34 +1860,21 @@ def render_actuals_upload_mode():
             st.info("Upload a file with one row per transaction, with a date, a line-item name, and an amount — or just continue if you don't have one.")
     else:
         try:
-            if dump_file.name.lower().endswith(".csv"):
-                df_dump = pd.read_csv(dump_file)
-            else:
+            sheet_name = None
+            if not dump_file.name.lower().endswith(".csv"):
+                if hasattr(dump_file, "seek"):
+                    dump_file.seek(0)
                 xls = pd.ExcelFile(dump_file, engine="openpyxl")
                 if len(xls.sheet_names) > 1:
                     st.warning(
-                        f"This workbook has {len(xls.sheet_names)} sheets — pick the one with **raw, one-row-per-transaction data**. "
-                        "A pivot table or summary sheet will not work here."
+                        f"This workbook has {len(xls.sheet_names)} sheets — pick the one with **raw, one-row-per-transaction data**."
                     )
                     sheet_name = st.selectbox("Sheet", xls.sheet_names, key="actuals_dump_sheet")
                 else:
                     sheet_name = xls.sheet_names[0]
-                df_dump = pd.read_excel(xls, sheet_name=sheet_name)
-                df_dump = _flatten_columns(df_dump)
-                # If this looks like a titled pivot (months not in row 1), try the next header rows.
-                month_hits = sum(1 for c in df_dump.columns if _month_number_from_label(c))
-                if month_hits < 2:
-                    raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-                    best_df, best_hits = df_dump, month_hits
-                    for header_row in range(0, min(8, len(raw))):
-                        trial = raw.copy()
-                        trial.columns = [str(v) if pd.notna(v) else f"col_{i}" for i, v in enumerate(trial.iloc[header_row])]
-                        trial = trial.iloc[header_row + 1 :].reset_index(drop=True)
-                        trial = _flatten_columns(trial)
-                        hits = sum(1 for c in trial.columns if _month_number_from_label(c))
-                        if hits > best_hits:
-                            best_df, best_hits = trial, hits
-                    df_dump = best_df
+            if hasattr(dump_file, "seek"):
+                dump_file.seek(0)
+            df_dump, sheet_name = load_actuals_table(dump_file, sheet_name)
         except Exception as e:
             st.error(f"Couldn't read this file: {e}")
             df_dump = None
@@ -1738,14 +1882,15 @@ def render_actuals_upload_mode():
         if df_dump is not None and df_dump.empty:
             st.warning("This file appears to be empty.")
         elif df_dump is not None:
-            st.caption("Preview of the first few rows — confirm this looks like raw transactions (one row per payment), not a pivot summary:")
-            st.markdown(df_dump.head(5).to_html(index=False), unsafe_allow_html=True)
+            st.caption("Preview — headers are detected automatically. If a data row is still showing as a title, set the four boxes from the values you can see.")
+            st.markdown(df_dump.head(8).to_html(index=False), unsafe_allow_html=True)
             st.markdown('<div class="step-label">Confirm columns</div>', unsafe_allow_html=True)
             dump_columns = list(df_dump.columns)
-            guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"])
-            guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor"])
-            guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"])
-            guessed_account = guess_column(dump_columns, ["account"])
+            inferred_date, inferred_amount, inferred_account, inferred_item = infer_actuals_columns(df_dump)
+            guessed_date = guess_column(dump_columns, ["date", "posted", "transaction"]) or inferred_date
+            guessed_dump_name = guess_column(dump_columns, ["name", "item", "channel", "department", "category", "line", "vendor", "desc"]) or inferred_item
+            guessed_amount = guess_column(dump_columns, ["amount", "value", "cost", "spend", "debit"]) or inferred_amount
+            guessed_account = guess_column(dump_columns, ["account name", "account", "vendor", "supplier", "counterparty"]) or inferred_account
 
             dc1, dc2, dc3, dc4 = st.columns(4)
             date_col = dc1.selectbox("Date column", dump_columns, index=dump_columns.index(guessed_date) if guessed_date in dump_columns else 0)
@@ -1753,8 +1898,13 @@ def render_actuals_upload_mode():
             amount_col = dc3.selectbox("Amount column", dump_columns, index=dump_columns.index(guessed_amount) if guessed_amount in dump_columns else 0)
             account_options = ["(none)"] + dump_columns
             account_default = guessed_account if guessed_account in dump_columns else "(none)"
-            account_picked = dc4.selectbox("Account Name column", account_options, index=account_options.index(account_default))
+            account_picked = dc4.selectbox("Account Name column", account_options, index=account_options.index(account_default) if account_default in account_options else 0)
             account_col = None if account_picked == "(none)" else account_picked
+            st.caption(
+                f"Detected → date: **{date_col}**, amount: **{amount_col}**, "
+                f"account: **{account_col or '(none)'}**. "
+                f"Account Name must be the column that contains **PULSE MEDIA FZ-LLC**."
+            )
 
             st.session_state["actuals_dump_mapping"] = (df_dump, date_col, dump_name_col, amount_col, account_col)
             st.caption("Matched against your budget file's line items by name in Forecasting mode.")
