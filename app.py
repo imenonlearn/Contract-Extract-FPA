@@ -2000,6 +2000,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         periods += start_m - ready_from
     year_months = [m for m in range(ready_from, min(12, expiry_cap) + 1)]
     orig_2026_budget = flat_rate * max(periods, 0)
+    validity_start_label = MONTH_NAMES[ready_from - 1] if 1 <= ready_from <= 12 else "?"
+    validity_end_label = MONTH_NAMES[min(12, expiry_cap) - 1] if 1 <= expiry_cap <= 12 else "Dec"
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
 
@@ -2094,6 +2096,11 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         "actual_period_end": through_month_idx,
         "forecast_months": remaining_period,
         "expiry_month": expiry_cap,
+        "periods": periods,
+        "duration_months": duration_months,
+        "contract_value": contract_value,
+        "validity_start": validity_start_label,
+        "validity_end": validity_end_label,
     }
     return display_total, new_monthly_rate, year_months, monthly_values, meta
 
@@ -2460,6 +2467,38 @@ def render_forecast_mode():
                 )
                 if method == "fixed":
                     reviewer_total = default_total
+
+                raw_dbg = item.get("raw_debug") or {}
+                monthly_orig = rf_meta.get("orig_monthly_rate") or 0.0
+                periods_used = rf_meta.get("periods")
+                if periods_used is None and monthly_orig:
+                    periods_used = round(orig_2026 / monthly_orig) if monthly_orig else 0
+                v_start = rf_meta.get("validity_start") or "?"
+                v_end = rf_meta.get("validity_end") or "?"
+                start_txt = (
+                    pd.Timestamp(eff_date).strftime("%d %b %Y")
+                    if eff_date is not None else str(raw_dbg.get("Effective Date (raw)") or "not found")
+                )
+                term_txt = raw_dbg.get("Term / Expiry (raw)") or (f"{duration} months" if duration else "not found")
+                value_txt = raw_dbg.get("Contract Value (raw)") or (f"{value:,.0f}" if value else "not found")
+                value_num = value if value else 0.0
+                dur_n = int(duration) if duration else 0
+                per_n = int(periods_used) if periods_used is not None else 0
+                with st.expander("How this envelope was calculated", expanded=True):
+                    st.markdown(
+                        f"""
+- **Extracted value:** {value_txt}  
+- **Term:** {term_txt} → **{dur_n or "?"} months**  
+- **Start date:** {start_txt}  
+- **Monthly rate** = contract figure ÷ term months  
+  `{value_num:,.0f} ÷ {dur_n or "?"} = {monthly_orig:,.2f}`  
+- **{year} validity:** {v_start}–{v_end} = **{per_n or "?"} month(s)**  
+  (start month is included; the month before start is included only if that month has an actual)  
+- **Column B envelope** = monthly rate × {year} validity months  
+  `{monthly_orig:,.2f} × {per_n or "?"} = {orig_2026:,.2f}`
+                        """.strip()
+                    )
+
                 active_months = active_months or []
                 monthly_values = monthly_values or {}
                 if method != "fixed" and monthly_values and total and abs(reviewer_total - total) > 0.01:
