@@ -1349,7 +1349,7 @@ def get_hierarchy(nodes: list):
             key = normalize_name(node["name"])
             heading_name = current_heading["name"] if current_heading else None
             subheading_name = current_subheading["name"] if current_subheading else None
-            line_item_index[key] = (heading_name, subheading_name)
+            line_item_index[key] = (heading_name, subheading_name, node["row"])
             if current_subheading is not None:
                 current_subheading["items"].append(node)
             elif current_heading is not None:
@@ -1589,8 +1589,21 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
             continue
         ws = wb[sheet_name]
 
-        # Insert bottom-to-top so earlier insertion points aren't shifted by later ones.
-        for ins in sorted(insertions, key=lambda x: x["insertion_row"], reverse=True):
+        def _write_line(ws, row, ins):
+            ws.cell(row=row, column=1).value = ins["counterparty"]
+            ws.cell(row=row, column=2).value = round(ins["prorated_total"], 2) if ins["prorated_total"] else 0
+            ins_monthly_values = ins.get("monthly_values") or {}
+            for m in range(1, 13):
+                col = MONTH_COL_START + (m - 1)
+                # Only the computed actual/forecast map — never back-fill a
+                # flat monthly rate into Jan–selected-month cells.
+                ws.cell(row=row, column=col).value = max(round(float(ins_monthly_values.get(m, 0) or 0), 2), 0)
+
+        updates = [ins for ins in insertions if ins.get("existing_row")]
+        creates = [ins for ins in insertions if not ins.get("existing_row")]
+        for ins in updates:
+            _write_line(ws, ins["existing_row"], ins)
+        for ins in sorted(creates, key=lambda x: x["insertion_row"], reverse=True):
             row = ins["insertion_row"]
             ws.insert_rows(row, 1)
             template_row = row - 1 if row > 1 else row + 1
@@ -1602,18 +1615,7 @@ def write_forecast_workbook(wb, plan_by_sheet: dict) -> bytes:
                 dst.border = _copy.copy(src.border)
                 dst.number_format = src.number_format
                 dst.alignment = _copy.copy(src.alignment)
-
-            ws.cell(row=row, column=1).value = ins["counterparty"]
-            ws.cell(row=row, column=2).value = round(ins["prorated_total"], 2) if ins["prorated_total"] else 0
-            for m in range(1, 13):
-                col = MONTH_COL_START + (m - 1)
-                ins_monthly_values = ins.get("monthly_values") or {}
-                if m in ins_monthly_values:
-                    ws.cell(row=row, column=col).value = max(round(ins_monthly_values[m], 2), 0)
-                elif m in ins["active_months"]:
-                    ws.cell(row=row, column=col).value = max(round(ins["monthly_rate"], 2), 0)
-                else:
-                    ws.cell(row=row, column=col).value = 0
+            _write_line(ws, row, ins)
 
         # Recompute the hierarchy now that rows have shifted, and rewrite rollup formulas.
         nodes = build_sheet_structure(ws)
@@ -2083,12 +2085,9 @@ def render_forecast_mode():
 
         sheet_info = sheet_data[category]
         existing_match = sheet_info["line_item_index"].get(normalize_name(counterparty))
-        if existing_match:
-            plan.append({
-                "file": file_name, "category": category, "counterparty": counterparty,
-                "status": "already_present", "existing_heading": existing_match[0], "existing_subheading": existing_match[1],
-            })
-            continue
+        existing_heading = existing_match[0] if existing_match else None
+        existing_subheading = existing_match[1] if existing_match else None
+        existing_row = existing_match[2] if existing_match and len(existing_match) > 2 else None
 
         row_idx = file_rows.index[0]
         eff_text = st.session_state.get(f"override_{row_idx}_Effective Date", row.get("Effective Date"))
@@ -2127,10 +2126,14 @@ def render_forecast_mode():
 
         plan.append({
             "file": file_name, "category": category, "counterparty": counterparty,
-            "status": "new", "sheet": category, "row_idx": row_idx,
+            "status": "update" if existing_row else "new",
+            "sheet": category, "row_idx": row_idx,
             "effective_date": eff_date, "duration_months": duration, "contract_value": value,
             "raw_debug": raw_debug,
             "suggested_heading": suggested_heading, "suggested_subheading": suggested_subheading,
+            "existing_heading": existing_heading,
+            "existing_subheading": existing_subheading,
+            "existing_row": existing_row,
         })
 
     if not plan:
@@ -2162,12 +2165,16 @@ def render_forecast_mode():
                 if item["status"] == "no_counterparty":
                     st.warning("Counterparty wasn't found in Contract Audit — fix that in Audit mode's 'Edit values' first.")
                     continue
-                if item["status"] == "already_present":
-                    loc = item["existing_heading"] + (f" → {item['existing_subheading']}" if item["existing_subheading"] else "")
-                    st.success(f"Already in the budget under **{loc}** — no new line will be added.")
-                    continue
+                if item.get("existing_row"):
+                    loc = (item.get("existing_heading") or "") + (
+                        f" → {item['existing_subheading']}" if item.get("existing_subheading") else ""
+                    )
+                    st.info(
+                        f"Already in the budget under **{loc or 'an existing row'}** — "
+                        f"Apply will **overwrite** that row with the recalculated figures."
+                    )
 
-                # status == "new"
+                # status == "new" or "update"
                 row_idx = item["row_idx"]
                 eff_date = item["effective_date"]
                 duration = item["duration_months"]
@@ -2341,6 +2348,7 @@ def render_forecast_mode():
                 plan_by_sheet.setdefault(item["category"], []).append({
                     "counterparty": item["counterparty"],
                     "insertion_row": find_insertion_row(chosen_heading, chosen_subheading_name),
+                    "existing_row": item.get("existing_row"),
                     "prorated_total": reviewer_total,
                     "monthly_rate": monthly_rate_calc or 0.0,
                     "active_months": active_months or list(range(1, 13)),
@@ -2350,6 +2358,13 @@ def render_forecast_mode():
                     "orig_monthly_rate": rf_meta.get("orig_monthly_rate", 0.0),
                     "ready_from": rf_meta.get("ready_from", 1),
                 })
+
+                preview_vals = [monthly_values.get(m, 0.0) for m in range(1, 13)]
+                preview_df = pd.DataFrame(
+                    [[item["counterparty"], reviewer_total] + preview_vals],
+                    columns=["Line Item", "Budget"] + MONTH_NAMES,
+                )
+                st.markdown(preview_df.to_html(index=False, escape=False, na_rep="0"), unsafe_allow_html=True)
 
     st.markdown('<div class="step-label">3 · Apply</div>', unsafe_allow_html=True)
     if st.button("Apply to workbook", type="primary", disabled=not plan_by_sheet):
