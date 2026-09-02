@@ -1137,11 +1137,24 @@ def guess_column(columns, keywords):
     return None
 
 
+_LEGAL_NAME_TOKENS = {
+    "llc", "l", "fz", "fzc", "fzco", "fze", "ltd", "limited", "co", "company",
+    "pjsc", "psc", "inc", "corp", "corporation", "llp", "plc", "sa", "sarl",
+    "gmbh", "the", "and", "of",
+}
+
+
 def normalize_name(x) -> str:
     text = str(x).strip().lower()
     text = text.replace("l.l.c.", "llc").replace("l.l.c", "llc")
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def significant_name_tokens(x) -> set:
+    """Drops legal suffixes so 'Pulse Media FZ-LLC' and 'Meridian … FZ-LLC'
+    do not look like the same vendor."""
+    return {t for t in normalize_name(x).split() if t not in _LEGAL_NAME_TOKENS and len(t) > 1}
 
 
 def _flatten_columns(df):
@@ -1247,28 +1260,35 @@ def lookup_actual_amount(actuals_lookup, name_candidates, month):
     if not actuals_lookup:
         return None
     norms = []
+    cores = []
     for n in name_candidates:
         if n is None or str(n).strip() == "":
             continue
         norms.append(normalize_name(n))
+        cores.append(significant_name_tokens(n))
     for n in norms:
         if (n, month) in actuals_lookup:
             return actuals_lookup[(n, month)]
+    # Distinctive-token match only. "fz" + "llc" must never pair Pulse with Meridian.
     for (nm, m), val in actuals_lookup.items():
         if m != month:
             continue
-        for n in norms:
-            if n and (n in nm or nm in n):
-                return val
-    # Token overlap: "nomad stay homes llc" vs "nomad stay homes"
-    for (nm, m), val in actuals_lookup.items():
-        if m != month:
+        nm_core = significant_name_tokens(nm)
+        if not nm_core:
             continue
-        nm_tokens = set(nm.split())
-        for n in norms:
-            tokens = set(n.split())
-            if len(tokens & nm_tokens) >= 2:
+        for core in cores:
+            if not core:
+                continue
+            if core == nm_core:
                 return val
+            if core <= nm_core or nm_core <= core:
+                return val
+            overlap = core & nm_core
+            need = 2 if min(len(core), len(nm_core)) >= 2 else 1
+            if len(overlap) >= need and len(overlap) >= min(len(core), len(nm_core)) - 0:
+                # Require at least half of the shorter distinctive name.
+                if len(overlap) * 2 >= min(len(core), len(nm_core)):
+                    return val
     return None
 
 
