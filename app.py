@@ -1400,11 +1400,13 @@ def parse_duration_months(term_text, effective_date=None):
 
 
 def parse_amount(value_text, duration_months=None):
-    """Parses a contract value figure. If the text indicates a recurring rate
-    (e.g. 'AED 42,000 per month') rather than a lump sum, converts it to the
-    TOTAL contract value using duration_months — otherwise every downstream
-    prorate calculation would treat the monthly figure as if it were the
-    entire contract, badly understating the real total."""
+    """Returns the figure that is spread over the contract term.
+
+    - "AED 42,000 per month" × 6 months → 252,000 (rate × term).
+    - "AED 480,000 per annum" on a 24-month term → 480,000 (the stated
+      figure is spread over the full term: 480,000 / 24 = 20,000 a month).
+      It is NOT doubled into a 960,000 two-year total.
+    """
     if not value_text or str(value_text).strip().lower() == "not found":
         return None
     text = str(value_text).replace(",", "")
@@ -1417,13 +1419,31 @@ def parse_amount(value_text, duration_months=None):
     if duration_months:
         if re.search(r"per\s*month|/\s*month|monthly", lower):
             return amount * duration_months
-        if re.search(r"per\s*annum|per\s*year|/\s*year|annually", lower):
-            return amount * (duration_months / 12.0)
         if re.search(r"per\s*quarter|quarterly", lower):
             return amount * (duration_months / 3.0)
         if re.search(r"per\s*week|weekly", lower):
             return amount * (duration_months * 4.345)
     return amount
+
+
+def first_validity_month(effective_date, calendar_year, actuals_by_month):
+    """First 2026 month that counts toward Column B.
+
+    Starts in the effective-date month (March for Pulse). The month before
+    that is pulled in only when an actual was posted there (February actual
+    on a March start). Otherwise the envelope starts in the start month.
+    """
+    if effective_date is None:
+        return 1
+    if effective_date.year > calendar_year:
+        return 13
+    if effective_date.year < calendar_year:
+        return 1
+    start_m = int(effective_date.month)
+    prior = start_m - 1
+    if prior >= 1 and actuals_by_month and prior in actuals_by_month:
+        return prior
+    return start_m
 
 
 def contract_end_date(effective_date, duration_months):
@@ -1757,8 +1777,6 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     if not spanned_months or flat_rate is None or contract_value is None or not duration_months:
         return None, None, [], {}, empty
 
-    ready_from = first_ready_month(effective_date, calendar_year) or 1
-
     actuals_by_month = {}
     if actuals_lookup:
         for m in range(1, 13):
@@ -1766,21 +1784,23 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
             if val is not None:
                 actuals_by_month[m] = float(val)
 
-    # Mid-month start is visible from that month only when an actual posted.
-    if (
-        effective_date is not None
-        and effective_date.year == calendar_year
-        and int(effective_date.month) in actuals_by_month
-    ):
-        ready_from = min(ready_from, int(effective_date.month))
-
-    # Column B = payment periods in the year × monthly rate (6 × 42,000),
-    # not the extra tail calendar month the end date may spill into.
-    year_months = list(spanned_months)
-    orig_2026_budget = year_total if year_total is not None else flat_rate * payment_periods_in_year(
-        effective_date, duration_months, calendar_year
-    )
+    ready_from = first_validity_month(effective_date, calendar_year, actuals_by_month)
     expiry_cap = expiry_month_cap(effective_date, duration_months, calendar_year)
+
+    # Payment periods that begin in this year (Mar–Dec = 10 for Pulse;
+    # Jan–Jun = 6 for Meridian). A prior-month actual adds that month
+    # (Feb actual on a March start → 11). The end-date tail month is
+    # not an extra payment period.
+    periods = payment_periods_in_year(effective_date, duration_months, calendar_year)
+    start_m = (
+        int(effective_date.month)
+        if effective_date is not None and effective_date.year == calendar_year
+        else 1
+    )
+    if ready_from < start_m:
+        periods += start_m - ready_from
+    year_months = [m for m in range(ready_from, min(12, expiry_cap) + 1)]
+    orig_2026_budget = flat_rate * max(periods, 0)
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
 
