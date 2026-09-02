@@ -1989,30 +1989,28 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
     ready_from = first_validity_month(effective_date, calendar_year, actuals_by_month)
     expiry_cap = expiry_month_cap(effective_date, duration_months, calendar_year)
 
-    # Payment periods that begin in this year (Mar–Dec = 10 for Pulse;
-    # Jan–Jun = 6 for Meridian). A prior-month actual adds that month
-    # (Feb actual on a March start → 11). The end-date tail month is
-    # not an extra payment period.
-    periods = payment_periods_in_year(effective_date, duration_months, calendar_year)
-    start_m = (
-        int(effective_date.month)
-        if effective_date is not None and effective_date.year == calendar_year
-        else 1
-    )
-    if ready_from < start_m:
-        periods += start_m - ready_from
-    elif ready_from > start_m and effective_date is not None and effective_date.year == calendar_year:
-        periods = max(periods - (ready_from - start_m), 0)
+    # Calendar span from first valid month through expiry (or Dec).
+    # Envelope months cannot exceed the contractual term: Meridian is always
+    # 6 × 42,000 even when January is dropped and the span becomes Feb–Jul.
     year_months = [m for m in range(ready_from, min(12, expiry_cap) + 1)]
+    periods = min(len(year_months), int(duration_months))
     orig_2026_budget = flat_rate * max(periods, 0)
-    validity_start_label = MONTH_NAMES[ready_from - 1] if 1 <= ready_from <= 12 else "?"
-    validity_end_label = MONTH_NAMES[min(12, expiry_cap) - 1] if 1 <= expiry_cap <= 12 else "Dec"
+    validity_months_for_b = year_months[:periods] if periods else []
+    validity_start_label = MONTH_NAMES[validity_months_for_b[0] - 1] if validity_months_for_b else "?"
+    validity_end_label = MONTH_NAMES[validity_months_for_b[-1] - 1] if validity_months_for_b else "?"
 
     monthly_values = {m: 0.0 for m in range(1, 13)}
 
-    # Close of selected month: contract is not in the book yet if its first
-    # budget month is still in the future and no start-month actual pulled it in.
-    if through_month_idx < ready_from:
+    # Contract does not exist in any month before its start month
+    # (select Feb, start 20 Mar → not in the book). The start month itself
+    # is still shown: with an actual it joins the envelope; without one
+    # that month is 0 and the envelope starts the following month.
+    start_month_num = (
+        int(effective_date.month)
+        if effective_date is not None and effective_date.year == calendar_year
+        else (1 if effective_date is not None and effective_date.year < calendar_year else 13)
+    )
+    if through_month_idx < start_month_num:
         start_label = (
             pd.Timestamp(effective_date).strftime("%d %b %Y")
             if effective_date is not None else "unknown start"
@@ -2022,9 +2020,8 @@ def compute_reforecast(contract_value, effective_date, duration_months, calendar
         meta["orig_monthly_rate"] = flat_rate
         meta["ready_from"] = ready_from
         meta["reason"] = (
-            f"Not in existence at the end of {MONTH_NAMES[through_month_idx - 1]} "
-            f"— starts {start_label} and has no actual in the start month. "
-            f"First budget month is {MONTH_NAMES[ready_from - 1]}."
+            f"Contract has not started at the end of {MONTH_NAMES[through_month_idx - 1]} "
+            f"— start date is {start_label}. No budget line this period."
         )
         return 0.0, 0.0, [], monthly_values, meta
 
@@ -2369,18 +2366,23 @@ def render_forecast_mode():
                 duration = item["duration_months"]
                 value = item["contract_value"]
 
-                if eff_date is None:
-                    entered = st.text_input(
-                        "Effective Date wasn't found — enter it (e.g. '1 June 2026')",
-                        key=f"fix_effdate_{item['file']}",
-                    )
-                    if entered.strip():
-                        parsed_date = parse_date_flexible(entered)
-                        if parsed_date is not None:
-                            eff_date = parsed_date
-                            st.session_state[f"override_{row_idx}_Effective Date"] = entered.strip()
-                        else:
-                            st.caption("Couldn't read that as a date — try a format like '1 June 2026'.")
+                default_eff = ""
+                if eff_date is not None:
+                    default_eff = pd.Timestamp(eff_date).strftime("%d %b %Y")
+                elif (item.get("raw_debug") or {}).get("Effective Date (raw)"):
+                    default_eff = str(item["raw_debug"]["Effective Date (raw)"])
+                entered_eff = st.text_input(
+                    "Effective date (correct it if extraction is wrong, e.g. '20 March 2026')",
+                    value=st.session_state.get(f"fix_effdate_{item['file']}", default_eff),
+                    key=f"fix_effdate_{item['file']}",
+                )
+                if entered_eff.strip():
+                    parsed_date = parse_date_flexible(entered_eff)
+                    if parsed_date is not None:
+                        eff_date = parsed_date
+                        st.session_state[f"override_{row_idx}_Effective Date"] = entered_eff.strip()
+                    else:
+                        st.caption("Couldn't read that as a date — try '20 March 2026'.")
 
                 if duration is None:
                     entered = st.text_input(
