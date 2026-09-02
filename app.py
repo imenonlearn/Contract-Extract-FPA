@@ -2652,8 +2652,240 @@ def render_forecast_mode():
         )
         st.caption("Heading, subheading, and grand-total cells now contain live Excel SUM formulas, so the workbook stays fully editable.")
 
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+
+
+def build_variance_model(wb, baseline, monthly_lookup, through_idx):
+    """One record per leaf line item, combining three sources:
+      - original plan (fixed_budget_baseline) -> what was approved, month by month
+      - actuals lookup (Step 3 dump)          -> what was actually spent
+      - updated workbook (Step 4)             -> what is still expected Jun-Dec
+    Returns (lines, cohorts)."""
+    lines = []
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for node in build_sheet_structure(ws):
+            if node["type"] != "line_item":
+                continue
+            row = node["row"]
+            display = node["name"]
+            name_norm = normalize_name(display)
+            wb_months = {m: _num(ws.cell(row=row, column=3 + m).value) for m in range(1, 13)}
+            annual = _num(ws.cell(row=row, column=2).value) or sum(wb_months.values())
+
+            base = baseline.get(name_norm) or {}
+            orig_months = base.get("orig_months")
+            plan_basis = "original plan"
+            if not orig_months or not any(orig_months.values()):
+                # No baseline (line pre-existed the forecast run): assume the annual
+                # figure is spread evenly over the months the workbook shows as live.
+                live = [m for m, v in wb_months.items() if v] or list(range(1, 13))
+                orig_months = {m: (annual / len(live) if m in live else 0.0) for m in range(1, 13)}
+                plan_basis = "annual ÷ live months (no baseline)"
+
+            actual_months = {}
+            for m in range(1, 13):
+                hit = lookup_actual_amount(monthly_lookup, [display, name_norm], m) if monthly_lookup else None
+                actual_months[m] = _num(hit) if hit is not None else None
+
+            cum_actual = sum(v or 0.0 for m, v in actual_months.items() if m <= through_idx)
+            cum_budget = sum(orig_months.get(m, 0.0) for m in range(1, through_idx + 1))
+            remaining_forecast = sum(wb_months[m] for m in range(through_idx + 1, 13))
+            remaining_plan = sum(orig_months.get(m, 0.0) for m in range(through_idx + 1, 13))
+            projected = cum_actual + remaining_forecast
+            headroom = annual - projected
+            month_actual = actual_months.get(through_idx)
+            month_plan = orig_months.get(through_idx, 0.0)
+            live_months = [m for m, v in orig_months.items() if v]
+            expired = bool(live_months) and max(live_months) <= through_idx
+
+            # Classification: headroom drives risk; pace is only a warning sign.
+            pace = (cum_actual / cum_budget * 100) if cum_budget else None
+            if annual == 0 and cum_actual == 0 and projected == 0:
+                status, color = "No budget", "gray"
+            elif annual == 0 and cum_actual > 0:
+                status, color = "Spend with no budget", "red"
+            elif headroom < -0.005 * max(annual, 1):
+                status, color = "At risk — projected overspend", "red"
+            elif pace is not None and pace > 115:
+                status, color = "Watch — ahead of plan, still fits", "orange"
+            elif annual and projected < 0.80 * annual:
+                status, color = "Underspent — surplus available", "blue"
+            else:
+                status, color = "On track", "green"
+
+            lines.append({
+                "sheet": sheet_name, "name_norm": name_norm, "display_name": display,
+                "annual": annual, "cum_budget": cum_budget, "cum_actual": cum_actual,
+                "remaining_forecast": remaining_forecast, "remaining_plan": remaining_plan,
+                "projected": projected, "headroom": headroom, "pace_pct": pace,
+                "month_actual": month_actual, "month_plan": month_plan,
+                "month_posted": month_actual is not None,
+                "expired": expired, "plan_basis": plan_basis,
+                "status": status, "color": color,
+                "orig_months": orig_months, "actual_months": actual_months, "wb_months": wb_months,
+            })
+
+    cohorts = {}
+    for ln in lines:
+        c = cohorts.setdefault(ln["sheet"], {
+            "annual": 0.0, "cum_budget": 0.0, "cum_actual": 0.0, "projected": 0.0,
+            "orig_by_month": {m: 0.0 for m in range(1, 13)},
+            "actual_by_month": {m: 0.0 for m in range(1, 13)},
+            "n_lines": 0, "n_at_risk": 0, "n_surplus": 0,
+        })
+        c["annual"] += ln["annual"]
+        c["cum_budget"] += ln["cum_budget"]
+        c["cum_actual"] += ln["cum_actual"]
+        c["projected"] += ln["projected"]
+        c["n_lines"] += 1
+        c["n_at_risk"] += ln["color"] == "red"
+        c["n_surplus"] += ln["color"] == "blue"
+        for m in range(1, 13):
+            c["orig_by_month"][m] += ln["orig_months"].get(m, 0.0)
+            c["actual_by_month"][m] += ln["actual_months"].get(m) or 0.0
+    for name, c in cohorts.items():
+        c["headroom"] = c["annual"] - c["projected"]
+        c["pace_pct"] = (c["cum_actual"] / c["cum_budget"] * 100) if c["cum_budget"] else None
+        if c["annual"] == 0 and c["cum_actual"] == 0:
+            c["status"], c["color"] = "No budget", "gray"
+        elif c["headroom"] < 0:
+            c["status"], c["color"] = "At risk — projected overspend", "red"
+        elif c["pace_pct"] is not None and c["pace_pct"] > 115:
+            c["status"], c["color"] = "Watch — spending ahead of plan", "orange"
+        elif c["annual"] and c["projected"] < 0.80 * c["annual"]:
+            c["status"], c["color"] = "Underspent", "blue"
+        else:
+            c["status"], c["color"] = "On track", "green"
+    return lines, cohorts
+
+
+def propose_reallocations(lines, safety_margin=0.10):
+    """Greedy donor matching. For each line that will overspend, fill its shortfall
+    from lines with surplus: same cohort first, then largest surplus, then
+    surplus that is already certain (contract expired, nothing left to forecast).
+    A donor never gives more than headroom minus a safety margin on what it still
+    expects to spend, and a donor with no posting in the through-month is only
+    used after every confirmed donor is exhausted."""
+    donors = []
+    for ln in lines:
+        if ln["headroom"] <= 0 or ln["color"] == "red":
+            continue
+        transferable = ln["headroom"] - safety_margin * ln["remaining_forecast"]
+        if ln["expired"]:
+            transferable = ln["headroom"]
+        if transferable <= 0:
+            continue
+        donors.append({"line": ln, "available": transferable, "confirmed": ln["month_posted"] or ln["expired"]})
+
+    proposals, uncovered = [], []
+    receivers = sorted([ln for ln in lines if ln["headroom"] < 0 and ln["annual"] > 0],
+                       key=lambda x: x["headroom"])
+    for rec in receivers:
+        need = -rec["headroom"]
+        ranked = sorted(donors, key=lambda d: (
+            not d["confirmed"],
+            d["line"]["sheet"] != rec["sheet"],
+            not d["line"]["expired"],
+            -d["available"],
+        ))
+        for d in ranked:
+            if need <= 0.005:
+                break
+            if d["available"] <= 0:
+                continue
+            take = min(need, d["available"])
+            d["available"] -= take
+            need -= take
+            proposals.append({
+                "from_line": d["line"]["display_name"], "from_sheet": d["line"]["sheet"],
+                "to_line": rec["display_name"], "to_sheet": rec["sheet"],
+                "amount": take, "cross_cohort": d["line"]["sheet"] != rec["sheet"],
+                "donor_confirmed": d["confirmed"], "donor_expired": d["line"]["expired"],
+            })
+        if need > 0.005:
+            uncovered.append({"line": rec["display_name"], "sheet": rec["sheet"], "shortfall": need})
+    return proposals, uncovered, donors
+
+
+def build_variance_export(workbook_bytes, lines, cohorts, proposals, uncovered, year, through_month):
+    """Adds two audit-trail sheets to a copy of the updated workbook without
+    touching any budget cell."""
+    wb = openpyxl.load_workbook(io.BytesIO(workbook_bytes))
+    from openpyxl.styles import Font, PatternFill
+    bold = Font(bold=True)
+    fills = {"red": "F8D7DA", "orange": "FFE5B4", "blue": "D6E4F0", "green": "D4EDDA", "gray": "EEEEEE"}
+
+    for title in (f"Variance {through_month}", "Reallocation proposal"):
+        if title in wb.sheetnames:
+            del wb[title]
+
+    ws = wb.create_sheet(f"Variance {through_month}")
+    ws.append([f"Variance analysis — actuals through {through_month} {year}"])
+    ws["A1"].font = bold
+    ws.append([])
+    ws.append(["Cohort", "Annual budget", f"Budget to {through_month}", f"Actual to {through_month}",
+               "Variance to date", "Remaining forecast", "Projected full year", "Headroom", "Status"])
+    for c in ws[3]:
+        c.font = bold
+    for name, c in cohorts.items():
+        ws.append([name, c["annual"], c["cum_budget"], c["cum_actual"], c["cum_actual"] - c["cum_budget"],
+                   c["projected"] - c["cum_actual"], c["projected"], c["headroom"], c["status"]])
+        ws.cell(row=ws.max_row, column=9).fill = PatternFill("solid", fgColor=fills[c["color"]])
+    ws.append([])
+    ws.append(["Line item", "Cohort", "Annual budget", f"Budget to {through_month}", f"Actual to {through_month}",
+               "Variance to date", f"{through_month} plan", f"{through_month} actual",
+               "Remaining forecast", "Projected full year", "Headroom", "Status", "Plan basis"])
+    hdr = ws.max_row
+    for c in ws[hdr]:
+        c.font = bold
+    for ln in sorted(lines, key=lambda x: (x["sheet"], x["headroom"])):
+        ws.append([ln["display_name"], ln["sheet"], ln["annual"], ln["cum_budget"], ln["cum_actual"],
+                   ln["cum_actual"] - ln["cum_budget"], ln["month_plan"],
+                   ln["month_actual"] if ln["month_actual"] is not None else "not posted",
+                   ln["remaining_forecast"], ln["projected"], ln["headroom"], ln["status"], ln["plan_basis"]])
+        ws.cell(row=ws.max_row, column=12).fill = PatternFill("solid", fgColor=fills[ln["color"]])
+    for col in range(2, 14):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 16
+    ws.column_dimensions["A"].width = 38
+    for row in ws.iter_rows(min_row=4):
+        for cell in row:
+            if isinstance(cell.value, float):
+                cell.number_format = "#,##0"
+
+    ws2 = wb.create_sheet("Reallocation proposal")
+    ws2.append([f"Proposed budget transfers — based on actuals through {through_month} {year}"])
+    ws2["A1"].font = bold
+    ws2.append(["Proposal only. Budget cells are unchanged; approve and post transfers separately."])
+    ws2.append([])
+    ws2.append(["From line", "From cohort", "To line", "To cohort", "Amount", "Cross-cohort", "Donor surplus confirmed", "Approved (Y/N)", "Notes"])
+    for c in ws2[4]:
+        c.font = bold
+    for p in proposals:
+        ws2.append([p["from_line"], p["from_sheet"], p["to_line"], p["to_sheet"], p["amount"],
+                    "Yes" if p["cross_cohort"] else "No", "Yes" if p["donor_confirmed"] else "Unconfirmed", "", ""])
+        ws2.cell(row=ws2.max_row, column=5).number_format = "#,##0"
+    if uncovered:
+        ws2.append([])
+        ws2.append(["Shortfalls not covered by any transfer — need new approval"])
+        ws2.cell(row=ws2.max_row, column=1).font = bold
+        for u in uncovered:
+            ws2.append([u["line"], u["sheet"], "", "", u["shortfall"]])
+            ws2.cell(row=ws2.max_row, column=5).number_format = "#,##0"
+    for col, w in zip("ABCDEFGHI", (36, 12, 36, 12, 14, 12, 22, 14, 30)):
+        ws2.column_dimensions[col].width = w
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 def render_variance_mode():
-    st.caption("Compares actual spend against your finalized budget by cohort and by line item — pure arithmetic, no AI, no API calls.")
+    st.caption(
+        "Compares actual spend against the approved plan, projects the full year from the "
+        "updated workbook, and proposes where budget can be moved — pure arithmetic, no AI, no API calls."
+    )
 
     if not st.session_state.get("forecast_workbook_bytes"):
         st.info("Complete **Step 4 (Forecasting)** and click 'Apply to workbook' first — variance tracking compares actuals against that finalized budget.")
@@ -2668,161 +2900,192 @@ def render_variance_mode():
     match_col = account_col or dump_name_col
 
     c1, c2 = st.columns(2)
-    year = c1.number_input("Calendar year", min_value=2020, max_value=2100, value=2026, step=1, key="variance_year")
-    through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=11, key="variance_through")
+    year = c1.number_input("Calendar year", min_value=2020, max_value=2100,
+                           value=int(st.session_state.get("forecast_year") or 2026), step=1, key="variance_year")
+    fc_through = st.session_state.get("forecast_through_month")
+    default_idx = MONTH_NAMES.index(fc_through) if fc_through in MONTH_NAMES else 11
+    through_month = c2.selectbox("Actuals known through", MONTH_NAMES, index=default_idx, key="variance_through")
     through_idx = MONTH_NAMES.index(through_month) + 1
+    if fc_through in MONTH_NAMES and MONTH_NAMES.index(fc_through) + 1 < through_idx:
+        st.warning(
+            f"The workbook was reforecast with actuals through **{fc_through}**, but you are looking at "
+            f"**{through_month}**. Months {fc_through}–{through_month} in the workbook are forecasts, not "
+            f"actuals; re-run Step 4 through {through_month} for a cleaner projection."
+        )
 
     wb = openpyxl.load_workbook(io.BytesIO(st.session_state.forecast_workbook_bytes), data_only=False)
-
-    # Read budgeted figures straight from the leaf line-item cells (not the
-    # heading/subheading/total formulas) so nothing depends on Excel having
-    # actually recalculated the workbook yet.
-    line_item_to_sheet = {}
-    sheet_budget = {}
-    line_item_budget = {}  # (sheet, normalized_name) -> {"annual": x, "to_date": y, "display_name": ...}
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        nodes = build_sheet_structure(ws)
-        annual_total, to_date_total = 0.0, 0.0
-        for node in nodes:
-            if node["type"] != "line_item":
-                continue
-            row = node["row"]
-            name_norm = normalize_name(node["name"])
-            line_item_to_sheet[name_norm] = sheet_name
-            annual = 0.0
-            to_date = 0.0
-            for m in range(1, 13):
-                val = ws.cell(row=row, column=3 + m).value
-                val = val if isinstance(val, (int, float)) else 0.0
-                annual += val
-                if m <= through_idx:
-                    to_date += val
-            line_item_budget[(sheet_name, name_norm)] = {
-                "annual": annual, "to_date": to_date, "display_name": node["name"],
-            }
-            annual_total += annual
-            to_date_total += to_date
-        sheet_budget[sheet_name] = {"annual": annual_total, "to_date": to_date_total}
-
-    # Aggregate actuals through the chosen month, matched by name.
-    df = df_dump.copy()
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df[(df[date_col].dt.year == year) & (df[date_col].dt.month <= through_idx)]
-    df["_name_norm"] = df[match_col].apply(normalize_name)
-    try:
-        df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
-    except Exception:
-        pass
-    actual_by_name = df.groupby("_name_norm")[amount_col].sum().to_dict()
-
-    sheet_actual = {}
-    line_item_actual = {}
-    for name_norm, amt in actual_by_name.items():
-        sheet_name = line_item_to_sheet.get(name_norm)
-        if sheet_name is None:
-            continue
-        sheet_actual[sheet_name] = sheet_actual.get(sheet_name, 0.0) + amt
-        line_item_actual[(sheet_name, name_norm)] = amt
-
-    def status_for(actual, budget):
-        if not budget:
-            return ("No budget", "gray") if not actual else ("Spend with no budget", "red")
-        pct = actual / budget * 100
-        if pct > 115:
-            return (f"Over pace ({pct:.0f}% of prorated budget)", "red")
-        if pct < 80:
-            return (f"Under pace ({pct:.0f}% of prorated budget)", "orange")
-        return (f"On track ({pct:.0f}% of prorated budget)", "green")
-
-    st.markdown('<div class="step-label">Cohort summary</div>', unsafe_allow_html=True)
-    for sheet_name in wb.sheetnames:
-        budget_to_date = sheet_budget.get(sheet_name, {}).get("to_date", 0.0)
-        annual_budget = sheet_budget.get(sheet_name, {}).get("annual", 0.0)
-        actual = sheet_actual.get(sheet_name, 0.0)
-        label, color = status_for(actual, budget_to_date)
-        full_name = CLASSIFICATION_CATEGORIES.get(sheet_name, sheet_name)
-
-        with st.container(border=True):
-            cols = st.columns([2, 1.3, 1.3, 1.3, 2])
-            cols[0].markdown(f"**{sheet_name} — {full_name}**")
-            cols[1].metric("Annual budget", f"{annual_budget:,.0f}")
-            cols[2].metric(f"Budget to {through_month}", f"{budget_to_date:,.0f}")
-            cols[3].metric(f"Actual to {through_month}", f"{actual:,.0f}")
-            variance = actual - budget_to_date
-            sign = "+" if variance > 0 else ""
-            cols[4].markdown(f":{color}[**{label}**]")
-            cols[4].caption(f"Variance: {sign}{variance:,.0f}")
-
-    st.markdown('<div class="step-label">Month flags vs original 2026 plan</div>', unsafe_allow_html=True)
-    st.caption("Compares the chosen month's actual with the original monthly budget (not the reforecasted figure).")
     baseline = st.session_state.get("fixed_budget_baseline") or {}
+
     monthly_lookup = build_monthly_actuals_lookup(df_dump, date_col, match_col, amount_col, year)
     if account_col and account_col != dump_name_col:
-        extra = build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year)
-        for k, v in extra.items():
+        for k, v in build_monthly_actuals_lookup(df_dump, date_col, dump_name_col, amount_col, year).items():
             monthly_lookup.setdefault(k, v)
-    month_flagged = False
-    names_to_check = set(line_item_to_sheet.keys()) | set(baseline.keys())
-    for name_norm in sorted(names_to_check):
-        actual_m = lookup_actual_amount(monthly_lookup, [name_norm], through_idx)
-        if actual_m is None:
-            continue
-        orig_rate = (baseline.get(name_norm) or {}).get("orig_monthly_rate")
-        display = (baseline.get(name_norm) or {}).get("display_name") or name_norm
-        if not orig_rate:
-            info = next((v for (s, n), v in line_item_budget.items() if n == name_norm), None)
-            if info:
-                live_months = 12
-                orig_rate = (info["annual"] / live_months) if info["annual"] else 0
-                display = info["display_name"]
-        if not orig_rate:
-            continue
-        pct = actual_m / orig_rate * 100
-        if pct > 150:
-            month_flagged = True
-            st.error(
-                f"**{display}** — {MONTH_NAMES[through_idx-1]} actual {actual_m:,.0f} is "
-                f"{pct:.0f}% of the original monthly budget {orig_rate:,.0f} "
-                f"(about {pct/100:.1f}× planned)."
-            )
-        elif pct > 115:
-            month_flagged = True
-            st.warning(
-                f"**{display}** — {MONTH_NAMES[through_idx-1]} actual {actual_m:,.0f} is "
-                f"{pct:.0f}% of the original monthly budget {orig_rate:,.0f}."
-            )
-    if not month_flagged:
-        st.success(f"No line is far over its original {through_month} budget.")
+    if not monthly_lookup:
+        st.error("No monthly actuals could be read from the Step 3 dump for this year — check the sheet and column mapping in Step 3.")
+        return
 
-    st.markdown('<div class="step-label">Line items to review</div>', unsafe_allow_html=True)
-    st.caption("Flagged when a line's actual spend to date is well outside its own prorated budget — possible candidates for reallocating budget between lines.")
+    lines, cohorts = build_variance_model(wb, baseline, monthly_lookup, through_idx)
+    proposals, uncovered, donors = propose_reallocations(lines)
 
-    flagged_any = False
-    for (sheet_name, name_norm), info in line_item_budget.items():
-        actual = line_item_actual.get((sheet_name, name_norm), 0.0)
-        budget_to_date = info["to_date"]
-        if budget_to_date == 0 and actual == 0:
+    # ---------------- Cohort summary ----------------
+    st.markdown('<div class="step-label">Cohort summary</div>', unsafe_allow_html=True)
+    st.caption(
+        f"Budget to {through_month} comes from the original approved plan; the remaining-year figure "
+        f"comes from the updated workbook. Headroom = annual budget − (actual to date + remaining forecast)."
+    )
+    total_annual = sum(c["annual"] for c in cohorts.values())
+    total_projected = sum(c["projected"] for c in cohorts.values())
+    total_actual = sum(c["cum_actual"] for c in cohorts.values())
+    tc = st.columns(4)
+    tc[0].metric("Total annual budget", f"{total_annual:,.0f}")
+    tc[1].metric(f"Total actual to {through_month}", f"{total_actual:,.0f}")
+    tc[2].metric("Projected full year", f"{total_projected:,.0f}")
+    tc[3].metric("Total headroom", f"{total_annual - total_projected:,.0f}",
+                 delta=f"{(total_annual - total_projected) / total_annual * 100:+.1f}%" if total_annual else None)
+
+    for sheet_name in wb.sheetnames:
+        c = cohorts.get(sheet_name)
+        if not c:
             continue
-        if budget_to_date == 0:
-            pct = None
-        else:
-            pct = actual / budget_to_date * 100
-        if pct is not None and 80 <= pct <= 115:
-            continue  # within normal range, don't clutter the list
-        flagged_any = True
         full_name = CLASSIFICATION_CATEGORIES.get(sheet_name, sheet_name)
-        if pct is None:
-            msg = f"**{info['display_name']}** ({sheet_name}) — {actual:,.0f} spent with no budget allocated to {through_month}."
-        elif pct > 115:
-            msg = f"**{info['display_name']}** ({sheet_name}) — {pct:.0f}% of its prorated budget used ({actual:,.0f} vs {budget_to_date:,.0f} expected). Consider reallocating from an underspent line in {full_name}."
-        else:
-            msg = f"**{info['display_name']}** ({sheet_name}) — only {pct:.0f}% of its prorated budget used ({actual:,.0f} vs {budget_to_date:,.0f} expected). Budget here may be available to reallocate."
-        st.warning(msg)
+        with st.container(border=True):
+            cols = st.columns([2, 1.1, 1.1, 1.1, 1.1, 1.1, 2])
+            cols[0].markdown(f"**{sheet_name} — {full_name}**")
+            cols[0].caption(f"{c['n_lines']} lines · {c['n_at_risk']} at risk · {c['n_surplus']} with surplus")
+            cols[1].metric("Annual", f"{c['annual']:,.0f}")
+            cols[2].metric(f"Plan to {through_month}", f"{c['cum_budget']:,.0f}")
+            cols[3].metric(f"Actual to {through_month}", f"{c['cum_actual']:,.0f}",
+                           delta=f"{c['cum_actual'] - c['cum_budget']:+,.0f}", delta_color="inverse")
+            cols[4].metric("Projected year", f"{c['projected']:,.0f}")
+            cols[5].metric("Headroom", f"{c['headroom']:,.0f}")
+            cols[6].markdown(f":{c['color']}[**{c['status']}**]")
+            if c["pace_pct"] is not None:
+                cols[6].caption(f"Pace: {c['pace_pct']:.0f}% of plan to date")
 
-    if not flagged_any:
-        st.success("No line items are significantly off pace — everything falls within a normal range of its prorated budget.")
+            with st.expander(f"Cumulative spend vs plan — {sheet_name}"):
+                cum_plan, cum_act, run_p, run_a = [], [], 0.0, 0.0
+                for m in range(1, through_idx + 1):
+                    run_p += c["orig_by_month"][m]
+                    run_a += c["actual_by_month"][m]
+                    cum_plan.append(run_p)
+                    cum_act.append(run_a)
+                chart_df = pd.DataFrame(
+                    {"Cumulative plan": cum_plan, "Cumulative actual": cum_act},
+                    index=MONTH_NAMES[:through_idx],
+                )
+                st.line_chart(chart_df)
+
+    # ---------------- At-risk lines + proposals ----------------
+    st.markdown('<div class="step-label">Lines at risk of overspending</div>', unsafe_allow_html=True)
+    at_risk = sorted([ln for ln in lines if ln["color"] == "red"], key=lambda x: x["headroom"])
+    if not at_risk:
+        st.success(f"No line is projected to exceed its annual budget on actuals through {through_month}.")
+    for ln in at_risk:
+        if ln["annual"] == 0:
+            st.error(f"**{ln['display_name']}** ({ln['sheet']}) — {ln['cum_actual']:,.0f} spent with no budget allocated.")
+            continue
+        st.error(
+            f"**{ln['display_name']}** ({ln['sheet']}) — projected {ln['projected']:,.0f} against a budget of "
+            f"{ln['annual']:,.0f} (shortfall {-ln['headroom']:,.0f}). Actual to {through_month}: "
+            f"{ln['cum_actual']:,.0f} vs plan {ln['cum_budget']:,.0f}; remaining forecast {ln['remaining_forecast']:,.0f}."
+        )
+
+    watch = [ln for ln in lines if ln["color"] == "orange"]
+    if watch:
+        st.markdown('<div class="step-label">Watch list — ahead of plan but still within budget</div>', unsafe_allow_html=True)
+        for ln in watch:
+            st.warning(
+                f"**{ln['display_name']}** ({ln['sheet']}) — {ln['pace_pct']:.0f}% of plan to date "
+                f"({ln['cum_actual']:,.0f} vs {ln['cum_budget']:,.0f}); projected {ln['projected']:,.0f} still "
+                f"fits the {ln['annual']:,.0f} budget with {ln['headroom']:,.0f} headroom. Likely timing, not overrun."
+            )
+
+    st.markdown('<div class="step-label">Suggested budget moves</div>', unsafe_allow_html=True)
+    if not at_risk or all(ln["annual"] == 0 for ln in at_risk):
+        st.caption("Nothing to fund — no shortfalls to cover.")
+    elif not proposals:
+        st.warning("No line has enough surplus to cover the shortfalls above. New approval will be needed.")
+    else:
+        st.caption(
+            "Donors are chosen same-cohort first, then by size of surplus, and only from lines that are not "
+            "themselves at risk. Each donor keeps a 10% margin on what it still expects to spend. "
+            "'Unconfirmed' means the donor has no posting for the selected month, so its surplus may just be a late invoice."
+        )
+        prop_rows = [{
+            "From": f"{p['from_line']} ({p['from_sheet']})",
+            "To": f"{p['to_line']} ({p['to_sheet']})",
+            "Amount": f"{p['amount']:,.0f}",
+            "Cross-cohort": "Yes" if p["cross_cohort"] else "",
+            "Donor surplus": "Certain (expired)" if p["donor_expired"] else ("Confirmed" if p["donor_confirmed"] else "Unconfirmed"),
+        } for p in proposals]
+        st.markdown(pd.DataFrame(prop_rows).to_html(index=False, escape=False), unsafe_allow_html=True)
+        if any(p["cross_cohort"] for p in proposals):
+            st.info("Some moves cross cohorts — these usually need a higher approval level than an in-cohort transfer.")
+    for u in uncovered:
+        st.error(f"**{u['line']}** ({u['sheet']}) — {u['shortfall']:,.0f} of its shortfall cannot be covered by any surplus; needs new approval.")
+
+    # ---------------- Donor pool ----------------
+    surplus_lines = sorted([ln for ln in lines if ln["headroom"] > 0 and ln["color"] != "red"], key=lambda x: -x["headroom"])
+    if surplus_lines:
+        with st.expander(f"Lines with surplus ({len(surplus_lines)})"):
+            rows = [{
+                "Line": ln["display_name"], "Cohort": ln["sheet"],
+                "Annual": f"{ln['annual']:,.0f}", "Projected": f"{ln['projected']:,.0f}",
+                "Headroom": f"{ln['headroom']:,.0f}",
+                "Status": "Expired — surplus certain" if ln["expired"] else ("Confirmed" if ln["month_posted"] else f"No {through_month} posting"),
+            } for ln in surplus_lines]
+            st.markdown(pd.DataFrame(rows).to_html(index=False, escape=False), unsafe_allow_html=True)
+
+    # ---------------- Month spikes ----------------
+    st.markdown(f'<div class="step-label">{through_month} spikes vs original monthly plan</div>', unsafe_allow_html=True)
+    st.caption("A spike with cumulative spend still within plan is invoice timing; a spike with cumulative also over is a real overrun.")
+    spiked = False
+    for ln in sorted(lines, key=lambda x: x["display_name"]):
+        if ln["month_actual"] is None or not ln["month_plan"]:
+            continue
+        pct = ln["month_actual"] / ln["month_plan"] * 100
+        if pct <= 115:
+            continue
+        spiked = True
+        kind = "real overrun" if ln["cum_actual"] > ln["cum_budget"] * 1.05 else "timing"
+        msg = (f"**{ln['display_name']}** ({ln['sheet']}) — {through_month} actual {ln['month_actual']:,.0f} is "
+               f"{pct:.0f}% of the planned {ln['month_plan']:,.0f} ({pct/100:.1f}×). Cumulative "
+               f"{ln['cum_actual']:,.0f} vs {ln['cum_budget']:,.0f} → {kind}.")
+        if kind == "real overrun" and pct > 150:
+            st.error(msg)
+        elif kind == "real overrun":
+            st.warning(msg)
+        else:
+            st.info(msg)
+    if not spiked:
+        st.success(f"No line is far over its original {through_month} plan.")
+
+    # ---------------- Full table + export ----------------
+    with st.expander("All line items"):
+        rows = [{
+            "Line": ln["display_name"], "Cohort": ln["sheet"],
+            "Annual": f"{ln['annual']:,.0f}",
+            f"Plan to {through_month}": f"{ln['cum_budget']:,.0f}",
+            f"Actual to {through_month}": f"{ln['cum_actual']:,.0f}",
+            "Remaining": f"{ln['remaining_forecast']:,.0f}",
+            "Projected": f"{ln['projected']:,.0f}",
+            "Headroom": f"{ln['headroom']:,.0f}",
+            "Status": ln["status"],
+        } for ln in sorted(lines, key=lambda x: (x["sheet"], x["headroom"]))]
+        st.markdown(pd.DataFrame(rows).to_html(index=False, escape=False), unsafe_allow_html=True)
+        if any(ln["plan_basis"] != "original plan" for ln in lines):
+            st.caption("Lines without a Step 4 baseline use annual ÷ live months as their plan; re-run Step 4 to include them for an exact plan.")
+
+    export_bytes = build_variance_export(
+        st.session_state.forecast_workbook_bytes, lines, cohorts, proposals, uncovered, year, through_month
+    )
+    st.download_button(
+        "Download workbook with variance & proposal sheets",
+        data=export_bytes,
+        file_name=f"budget_variance_{through_month}_{year}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("Adds two sheets to the updated workbook as an audit trail. No budget cell is changed — transfers are proposals until approved.")
 # ---------------------------------------------------------------------------
 # Wizard navigation — each step must be confirmed before the next unlocks
 # ---------------------------------------------------------------------------
