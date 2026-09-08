@@ -152,7 +152,7 @@ st.markdown(
         font-family: "Playfair Display", Georgia, "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        font-size: 200px !important;
+        font-size: 120px !important;
         letter-spacing: 0.02em;
         line-height: 1.05 !important;
         white-space: nowrap;
