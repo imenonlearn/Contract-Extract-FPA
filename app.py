@@ -129,7 +129,7 @@ st.markdown(
         display: flex;
         align-items: center;
         justify-content: center;
-        min-height: 230px;
+        min-height: 195px;
         margin: 0 0 30px;
     }
     .cx-logo {
@@ -152,7 +152,7 @@ st.markdown(
         font-family: "Playfair Display", Georgia, "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        font-size: 120px !important;
+        font-size: 160px !important;
         letter-spacing: 0.02em;
         line-height: 1.05 !important;
         white-space: nowrap;
@@ -183,7 +183,7 @@ st.markdown(
         .cx-header { min-height: 140px; }
         .cx-logo { height: 96px; padding: 10px 16px; border-radius: 14px; }
         .cx-logo img { height: 72px; }
-        .wordmark { font-size: 110px !important; }
+        .wordmark { font-size: 88px !important; }
         .wordmark-sub { font-size: 1.05rem; }
     }
     @media (max-width: 760px) {
