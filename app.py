@@ -127,46 +127,62 @@ st.markdown(
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 14px;
-        margin: 0 0 10px;
+        gap: 42px;
+        margin: 0 0 30px;
     }
     .cx-logo {
         background: #F4FBFF;
-        border-radius: 8px;
-        padding: 5px 8px;
-        height: 48px;
+        border-radius: 18px;
+        padding: 15px 24px;
+        height: 144px;
         display: flex;
         align-items: center;
         flex-shrink: 0;
     }
-    .cx-logo img { height: 36px; width: auto; display: block; }
+    .cx-logo img { height: 108px; width: auto; display: block; }
     .wordmark-wrap { text-align: left; margin: 0; }
     .wordmark {
         margin: 0;
         font-family: "Playfair Display", "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        font-size: 44px;
+        font-size: 132px;
         letter-spacing: 0.03em;
         line-height: 1;
         color: #F3FBFF;
-        -webkit-text-stroke: 1px #16323c;
+        -webkit-text-stroke: 2px #16323c;
         text-shadow:
-            0 1px 0 #ffffff,
-            0 0 3px rgba(190, 255, 230, 0.9),
-            0 0 10px rgba(94, 228, 242, 0.55),
-            0 0 18px rgba(46, 200, 222, 0.25),
-            2px 3px 0 #0a2430;
+            0 2px 0 #ffffff,
+            0 0 8px rgba(190, 255, 230, 0.9),
+            0 0 24px rgba(94, 228, 242, 0.55),
+            0 0 44px rgba(46, 200, 222, 0.25),
+            5px 7px 0 #0a2430;
     }
     .wordmark-sub {
-        margin-top: 5px;
+        margin-top: 12px;
         color: #8AA3B0;
-        font-size: 0.78rem;
+        font-size: 1.35rem;
         letter-spacing: 0.06em;
         text-transform: none;
     }
     .app-title { display: none; }
     .app-subtitle { display: none; }
+
+    /* keep the enlarged header from overflowing on narrow windows */
+    @media (max-width: 1100px) {
+        .cx-header { gap: 24px; }
+        .cx-logo { height: 96px; padding: 10px 16px; border-radius: 14px; }
+        .cx-logo img { height: 72px; }
+        .wordmark { font-size: 84px; }
+        .wordmark-sub { font-size: 1.05rem; }
+    }
+    @media (max-width: 760px) {
+        .cx-header { flex-wrap: wrap; gap: 16px; }
+        .cx-logo { height: 72px; padding: 8px 12px; }
+        .cx-logo img { height: 54px; }
+        .wordmark { font-size: 56px; -webkit-text-stroke: 1px #16323c; }
+        .wordmark-sub { font-size: 0.9rem; }
+    }
 
     .step-label {
         font-family: 'Inter', sans-serif;
