@@ -126,9 +126,12 @@ st.markdown(
     .cx-header {
         display: flex;
         align-items: center;
-        justify-content: center;
+        justify-content: flex-start;
+        text-align: left;
         gap: 42px;
         margin: 0 0 30px;
+        /* pull the chip out to the very left edge of the page */
+        margin-left: -1.5rem;
     }
     .cx-logo {
         background: #F4FBFF;
@@ -177,7 +180,7 @@ st.markdown(
         .wordmark-sub { font-size: 1.05rem; }
     }
     @media (max-width: 760px) {
-        .cx-header { flex-wrap: wrap; gap: 16px; }
+        .cx-header { flex-wrap: wrap; gap: 16px; margin-left: 0; }
         .cx-logo { height: 72px; padding: 8px 12px; }
         .cx-logo img { height: 54px; }
         .wordmark { font-size: 56px; -webkit-text-stroke: 1px #16323c; }
