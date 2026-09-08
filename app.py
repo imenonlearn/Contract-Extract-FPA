@@ -129,7 +129,7 @@ st.markdown(
         display: flex;
         align-items: center;
         justify-content: center;
-        min-height: 190px;
+        min-height: 230px;
         margin: 0 0 30px;
     }
     .cx-logo {
@@ -152,10 +152,9 @@ st.markdown(
         font-family: "Playfair Display", Georgia, "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        /* scales with the window: never below 130px, up to 210px on a wide screen */
-        font-size: clamp(130px, 11vw, 210px);
+        font-size: 200px !important;
         letter-spacing: 0.02em;
-        line-height: 1.05;
+        line-height: 1.05 !important;
         white-space: nowrap;
         /* polished metal sheen, painted into the glyphs themselves */
         background: linear-gradient(180deg, #FFFFFF 0%, #EAFBFF 38%, #A8E8F6 62%, #58C8DE 100%);
@@ -184,14 +183,14 @@ st.markdown(
         .cx-header { min-height: 140px; }
         .cx-logo { height: 96px; padding: 10px 16px; border-radius: 14px; }
         .cx-logo img { height: 72px; }
-        .wordmark { font-size: 96px; }
+        .wordmark { font-size: 110px !important; }
         .wordmark-sub { font-size: 1.05rem; }
     }
     @media (max-width: 760px) {
         .cx-header { flex-direction: column; min-height: 0; gap: 12px; }
         .cx-logo { position: static; transform: none; height: 72px; padding: 8px 12px; }
         .cx-logo img { height: 54px; }
-        .wordmark { font-size: 56px; white-space: normal; }
+        .wordmark { font-size: 64px !important; white-space: normal; }
         .wordmark-sub { font-size: 0.9rem; }
     }
 
@@ -421,7 +420,7 @@ st.markdown(
     <div class="cx-header">
       <div class="cx-logo"><img alt="HLB HAMT" src="data:image/png;base64,{_LOGO_B64}" /></div>
       <div class="wordmark-wrap">
-        <p class="wordmark">ContraXt</p>
+        <div class="wordmark">ContraXt</div>
         <div class="wordmark-sub">AI Driven Contractual Terms Extraction &amp; Forecasting</div>
       </div>
     </div>
