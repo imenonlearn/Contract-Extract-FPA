@@ -123,17 +123,20 @@ st.markdown(
 
     .block-container { padding-top: 1.1rem !important; padding-bottom: 2rem !important; }
     [data-testid="stSidebar"] img { max-height: 44px !important; width: auto !important; }
+    /* logo pinned to the far left, wordmark centred on the page */
     .cx-header {
+        position: relative;
         display: flex;
         align-items: center;
-        justify-content: flex-start;
-        text-align: left;
-        gap: 42px;
+        justify-content: center;
+        min-height: 190px;
         margin: 0 0 30px;
-        /* pull the chip out to the very left edge of the page */
-        margin-left: -1.5rem;
     }
     .cx-logo {
+        position: absolute;
+        left: -1.5rem;            /* past the page padding, flush with the edge */
+        top: 50%;
+        transform: translateY(-50%);
         background: #F4FBFF;
         border-radius: 18px;
         padding: 15px 24px;
@@ -143,13 +146,14 @@ st.markdown(
         flex-shrink: 0;
     }
     .cx-logo img { height: 108px; width: auto; display: block; }
-    .wordmark-wrap { text-align: left; margin: 0; flex: 0 1 auto; min-width: 0; }
+    .wordmark-wrap { text-align: center; margin: 0 auto; }
     .wordmark {
         margin: 0;
         font-family: "Playfair Display", Georgia, "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
-        font-size: 132px;
+        /* scales with the window: never below 130px, up to 210px on a wide screen */
+        font-size: clamp(130px, 11vw, 210px);
         letter-spacing: 0.02em;
         line-height: 1.05;
         white-space: nowrap;
@@ -177,15 +181,15 @@ st.markdown(
 
     /* keep the enlarged header from overflowing on narrow windows */
     @media (max-width: 1100px) {
-        .cx-header { gap: 24px; }
+        .cx-header { min-height: 140px; }
         .cx-logo { height: 96px; padding: 10px 16px; border-radius: 14px; }
         .cx-logo img { height: 72px; }
-        .wordmark { font-size: 84px; }
+        .wordmark { font-size: 96px; }
         .wordmark-sub { font-size: 1.05rem; }
     }
     @media (max-width: 760px) {
-        .cx-header { flex-wrap: wrap; gap: 16px; margin-left: 0; }
-        .cx-logo { height: 72px; padding: 8px 12px; }
+        .cx-header { flex-direction: column; min-height: 0; gap: 12px; }
+        .cx-logo { position: static; transform: none; height: 72px; padding: 8px 12px; }
         .cx-logo img { height: 54px; }
         .wordmark { font-size: 56px; white-space: normal; }
         .wordmark-sub { font-size: 0.9rem; }
