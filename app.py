@@ -143,23 +143,27 @@ st.markdown(
         flex-shrink: 0;
     }
     .cx-logo img { height: 108px; width: auto; display: block; }
-    .wordmark-wrap { text-align: left; margin: 0; }
+    .wordmark-wrap { text-align: left; margin: 0; flex: 0 1 auto; min-width: 0; }
     .wordmark {
         margin: 0;
-        font-family: "Playfair Display", "Times New Roman", serif;
+        font-family: "Playfair Display", Georgia, "Times New Roman", serif;
         font-style: italic;
         font-weight: 800;
         font-size: 132px;
-        letter-spacing: 0.03em;
-        line-height: 1;
-        color: #F3FBFF;
-        -webkit-text-stroke: 2px #16323c;
-        text-shadow:
-            0 2px 0 #ffffff,
-            0 0 8px rgba(190, 255, 230, 0.9),
-            0 0 24px rgba(94, 228, 242, 0.55),
-            0 0 44px rgba(46, 200, 222, 0.25),
-            5px 7px 0 #0a2430;
+        letter-spacing: 0.02em;
+        line-height: 1.05;
+        white-space: nowrap;
+        /* polished metal sheen, painted into the glyphs themselves */
+        background: linear-gradient(180deg, #FFFFFF 0%, #EAFBFF 38%, #A8E8F6 62%, #58C8DE 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        -webkit-text-fill-color: transparent;
+        /* drop-shadow works on the glyph edges, so the letters stay crisp */
+        filter:
+            drop-shadow(0 3px 0 rgba(8, 32, 42, 0.85))
+            drop-shadow(0 0 18px rgba(46, 200, 222, 0.45));
+        padding: 0.06em 0.04em 0.12em;
     }
     .wordmark-sub {
         margin-top: 12px;
@@ -183,7 +187,7 @@ st.markdown(
         .cx-header { flex-wrap: wrap; gap: 16px; margin-left: 0; }
         .cx-logo { height: 72px; padding: 8px 12px; }
         .cx-logo img { height: 54px; }
-        .wordmark { font-size: 56px; -webkit-text-stroke: 1px #16323c; }
+        .wordmark { font-size: 56px; white-space: normal; }
         .wordmark-sub { font-size: 0.9rem; }
     }
 
